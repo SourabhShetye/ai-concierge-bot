@@ -1,0 +1,29 @@
+category: Appetizers
+item: Binary Bites
+price: $8
+description: Crispy fried jalapeño poppers filled with cream cheese, served with a sweet chili dipping sauce.
+
+category: Appetizers
+item: Server-Side Sliders
+price: $12
+description: Trio of mini beef burgers with caramelized onions, cheddar cheese, and our secret "source code" sauce.
+
+category: Mains
+item: The Full Stack Burger
+price: $18
+description: Double beef patty, bacon, egg, lettuce, tomato, and onion rings on a brioche bun. Served with fries.
+
+category: Mains
+item: Python Pasta
+price: $16
+description: Tagliatelle tossed in a creamy pesto sauce with pine nuts and parmesan. (Vegetarian)
+
+category: Drinks
+item: Java Jolt Espresso
+price: $4
+description: A double shot of premium Arabica beans.
+
+category: Drinks
+item: Memory Leak Mocktail
+price: $7
+description: Refreshing lime and mint soda with a splash of cranberry juice.
