@@ -19,7 +19,7 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 # UPDATE THIS WITH YOUR NEW NGROK URL
-WEBHOOK_URL = "WEBHOOK_URL" 
+WEBHOOK_URL = "https://ai-concierge-bot.onrender.com" 
 
 # 2. Initialize Clients
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
