@@ -7,29 +7,28 @@ from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGener
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
-from telegram import Update, Bot
+from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.request import HTTPXRequest
 
-# 1. Load Config & Global Clients (Initialize ONCE to save memory)
+# 1. Load Config & Global Clients
 load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
 # Clients
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
 
-# ✅ The "Classic" model that works with the 0.3.2 library
-llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0)
+# ✅ FIX 1: Use the standard "gemini-pro" which is most stable
+llm = ChatGoogleGenerativeAI(model="gemini-pro", temperature=0)
 
 # Initialize Bot Instance Globally
 request = HTTPXRequest(connection_pool_size=10, read_timeout=20.0, connect_timeout=20.0)
 ptb_app = Application.builder().token(TELEGRAM_TOKEN).request(request).build()
 
-# 2. CORE LOGIC FUNCTIONS (Same as before)
+# 2. CORE LOGIC FUNCTIONS
 def get_user_restaurant(user_id):
     response = supabase.table("user_sessions").select("current_restaurant_id").eq("user_id", user_id).execute()
     return response.data[0]['current_restaurant_id'] if response.data else None
@@ -97,13 +96,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Please scan a QR code first.")
         return
 
-    # Check for simple keywords first (Fast Response)
     if "wifi" in user_text.lower():
         details = get_restaurant_details(rest_id)
         await update.message.reply_text(f"📶 WiFi Password: {details.get('wifi_password', 'Ask staff')}")
         return
 
-    # Heavy AI Processing
     details = get_restaurant_details(rest_id)
     policy_info = f"WiFi: {details.get('wifi_password')}. Docs: {details.get('policy_docs')}"
     
@@ -119,25 +116,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ptb_app.add_handler(CommandHandler("start", start))
 ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-# 5. FASTAPI SERVER (The "Background Task" Fix)
+# 5. FASTAPI SERVER
 app = FastAPI()
 
 async def process_telegram_update(data: dict):
-    """Processes the update in the background so Telegram doesn't timeout."""
-    async with ptb_app:
-        await ptb_app.initialize()
+    """
+    ✅ FIX 2: Do NOT use 'async with ptb_app:'. 
+    The app is already running globally. Just process the update directly.
+    """
+    try:
         update = Update.de_json(data, ptb_app.bot)
         await ptb_app.process_update(update)
+    except Exception as e:
+        print(f"Error processing update: {e}")
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
-    """
-    1. Receive message.
-    2. Tell Telegram '200 OK' INSTANTLY.
-    3. Process logic later.
-    """
     data = await request.json()
-    # Add processing to background queue
     background_tasks.add_task(process_telegram_update, data)
     return {"status": "ok"}
 
@@ -146,9 +141,9 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
 async def root():
     return {"status": "alive", "message": "Concierge Bot is running"}
 
-# Startup Event to initialize App
+# Startup Event
 @app.on_event("startup")
 async def on_startup():
-    # In v21+, we just need to initialize, no 'await bot.initialize()' needed manually
+    # Initialize and Start the bot ONCE globally
     await ptb_app.initialize()
-    await ptb_app.start()  # <--- ADD THIS LINE
+    await ptb_app.start()
