@@ -19,7 +19,7 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 # UPDATE THIS WITH YOUR NEW NGROK URL
-WEBHOOK_URL = "https://7cce-86-98-83-162.ngrok-free.app" 
+WEBHOOK_URL = "WEBHOOK_URL" 
 
 # 2. Initialize Clients
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
