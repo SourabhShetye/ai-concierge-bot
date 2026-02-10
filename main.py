@@ -79,50 +79,56 @@ async def generate_gemini_response(prompt_text):
             return None
 
 # 5. BOOKING LOGIC
+# Updated Booking Logic with DEBUGGING
 async def handle_booking(update: Update, user_text: str, rest_id: str):
-    """
-    Uses AI to extract booking details and save to Supabase.
-    """
+    # 1. AI Extraction
     extraction_prompt = f"""
     Extract booking details from: "{user_text}"
     Current Date: {datetime.now().strftime("%Y-%m-%d")}
     
-    Return ONLY a JSON object (no markdown) with keys:
-    - valid (bool): true if date, time AND guests are present.
-    - date (string): YYYY-MM-DD.
-    - time (string): HH:MM.
-    - guests (int).
-    - missing_info (string): Question to ask user if valid is false.
+    Return JSON ONLY:
+    {{
+      "valid": true/false,
+      "date": "YYYY-MM-DD",
+      "time": "HH:MM",
+      "guests": 2,
+      "missing_info": "What is missing?"
+    }}
     """
     
     ai_response = await generate_gemini_response(extraction_prompt)
     
     try:
-        # Clean JSON
         clean_json = ai_response.replace("```json", "").replace("```", "").strip()
         details = json.loads(clean_json)
         
         if not details.get("valid"):
-            await update.message.reply_text(details.get("missing_info", "Please provide date, time, and number of people."))
+            await update.message.reply_text(details.get("missing_info", "I need Date, Time, and Number of People."))
             return
 
-        # Save to Supabase
+        # 2. Save to Supabase (Exact Column Match)
         user = update.effective_user
+        
         booking_data = {
-            "user_id": user.id,
-            "restaurant_id": rest_id,
-            "booking_time": f"{details['date']}T{details['time']}:00",
-            "party_size": details['guests'],
-            "status": "confirmed",
-            "customer_name": user.full_name or "Guest"
+            "restaurant_id": str(rest_id),           # Matches SQL 'restaurant_id'
+            "user_id": str(user.id),                 # Matches SQL 'user_id'
+            "customer_name": user.full_name or "Guest", # Matches SQL 'customer_name'
+            "party_size": int(details['guests']),    # Matches SQL 'party_size'
+            "booking_time": f"{details['date']} {details['time']}", # Matches SQL 'booking_time'
+            "status": "confirmed"                    # Matches SQL 'status'
         }
         
-        supabase.table("bookings").insert(booking_data).execute()
-        await update.message.reply_text(f"✅ Booking Confirmed!\n📅 {details['date']} at {details['time']}\n👥 {details['guests']} People")
+        print(f"DEBUG: Sending Data to DB -> {booking_data}") # Log for Render Console
+        
+        # Execute Insert
+        data = supabase.table("bookings").insert(booking_data).execute()
+        
+        # 3. Confirm to User
+        await update.message.reply_text(f"✅ Booking Confirmed!\n👤 Name: {user.full_name}\n📅 Date: {details['date']}\n⏰ Time: {details['time']}\n👥 Guests: {details['guests']}")
         
     except Exception as e:
-        print(f"Booking Error: {e}")
-        await update.message.reply_text("Please specify Date, Time, and Party Size clearly.")
+        print(f"CRITICAL DB ERROR: {e}")
+        await update.message.reply_text(f"❌ System Error: {e}")
 
 # 6. Telegram Handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
