@@ -17,13 +17,17 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
-# Global Model Name Cache
+# Global variables
 CURRENT_MODEL_NAME = None
 
 # 2. Clients
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# 3. DYNAMIC MODEL DISCOVERY
+# 3. INITIALIZE BOT (Crucial Step - Definition)
+request = HTTPXRequest(connection_pool_size=10, read_timeout=20.0, connect_timeout=20.0)
+ptb_app = Application.builder().token(TELEGRAM_TOKEN).request(request).build()
+
+# 4. DYNAMIC MODEL DISCOVERY
 async def find_working_model():
     global CURRENT_MODEL_NAME
     url = f"https://generativelanguage.googleapis.com/v1beta/models?key={GOOGLE_API_KEY}"
@@ -45,7 +49,7 @@ async def find_working_model():
             if data["models"]: CURRENT_MODEL_NAME = data["models"][0]["name"]
         except: pass
 
-# 4. CUSTOM AI CLIENT (Direct & Smart)
+# 5. CUSTOM AI CLIENT
 async def generate_gemini_response(prompt_text):
     global CURRENT_MODEL_NAME
     if not CURRENT_MODEL_NAME: await find_working_model()
@@ -64,22 +68,18 @@ async def generate_gemini_response(prompt_text):
             return data["candidates"][0]["content"]["parts"][0]["text"]
         except: return None
 
-# 5. BOOKING LOGIC
+# 6. BOOKING LOGIC
 async def handle_booking(update: Update, user_text: str, rest_id: str):
-    """
-    Uses AI to extract booking details and save to Supabase.
-    """
-    # 1. Ask AI to extract JSON details
     extraction_prompt = f"""
     Extract booking details from this text: "{user_text}"
     Current Date/Time: {datetime.now().strftime("%Y-%m-%d %H:%M")}
     
     Return ONLY a JSON object with these keys:
     - valid (boolean): true if user specified date, time, AND people.
-    - date (string): YYYY-MM-DD format (infer from "tomorrow", "next friday", etc).
+    - date (string): YYYY-MM-DD format.
     - time (string): HH:MM format (24h).
     - guests (integer): number of people.
-    - missing_info (string): what to ask for if valid is false (e.g. "What time?", "How many people?").
+    - missing_info (string): what to ask for if valid is false.
     
     Do not add markdown formatting. Just the raw JSON string.
     """
@@ -87,16 +87,13 @@ async def handle_booking(update: Update, user_text: str, rest_id: str):
     ai_response = await generate_gemini_response(extraction_prompt)
     
     try:
-        # Clean AI response to ensure valid JSON
         clean_json = ai_response.replace("```json", "").replace("```", "").strip()
         details = json.loads(clean_json)
         
         if not details.get("valid"):
-            # If details missing, ask the user
             await update.message.reply_text(details.get("missing_info", "Could you provide the date, time, and party size?"))
             return
 
-        # 2. Save to Supabase
         user = update.effective_user
         booking_data = {
             "user_id": user.id,
@@ -104,19 +101,17 @@ async def handle_booking(update: Update, user_text: str, rest_id: str):
             "booking_time": f"{details['date']}T{details['time']}:00",
             "party_size": details['guests'],
             "status": "confirmed",
-            "customer_name": user.full_name or user.username or "Guest"
+            "customer_name": user.full_name or "Guest"
         }
         
         supabase.table("bookings").insert(booking_data).execute()
-        
-        # 3. Confirm
         await update.message.reply_text(f"✅ Booking Confirmed!\n📅 Date: {details['date']}\n⏰ Time: {details['time']}\n👥 Guests: {details['guests']}")
         
     except Exception as e:
         print(f"Booking Error: {e}")
         await update.message.reply_text("I understood you want to book, but I need the Date, Time, and Number of People clearly stated.")
 
-# 6. Telegram Handlers
+# 7. TELEGRAM HANDLERS
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     args = context.args
@@ -125,7 +120,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     rest_id = args[0]
     
-    # Get Restaurant
     res = supabase.table("restaurants").select("*").eq("id", rest_id).execute()
     details = res.data[0] if res.data else None
     
@@ -140,7 +134,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_text = update.message.text
     
-    # Get Session
     res = supabase.table("user_sessions").select("current_restaurant_id").eq("user_id", user_id).execute()
     rest_id = res.data[0]['current_restaurant_id'] if res.data else None
 
@@ -155,7 +148,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Normal Chat / Menu Query
-    # Get Menu items (First 15 items safely)
     try:
         menu_res = supabase.table("menu_items").select("content").eq("restaurant_id", rest_id).limit(15).execute()
         menu_context = "\n".join([item['content'] for item in menu_res.data])
@@ -175,10 +167,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("I'm having trouble thinking. Please ask staff.")
 
+# 8. REGISTER HANDLERS (Now ptb_app is definitely defined)
 ptb_app.add_handler(CommandHandler("start", start))
 ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-# 7. FastAPI App
+# 9. FASTAPI APP
 app = FastAPI()
 
 async def process_telegram_update(data: dict):
