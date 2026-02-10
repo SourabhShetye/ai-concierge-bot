@@ -198,9 +198,11 @@ async def on_startup():
     await ptb_app.start()
     await ptb_app.bot.set_webhook(f"{WEBHOOK_URL}/webhook")
 
+# Health Check Endpoint for UptimeRobot
 @app.get("/")
-def home():
-    return {"status": "alive", "message": "Concierge Bot is running"}
+@app.head("/")
+def health_check():
+    return {"status": "alive", "message": "Bot is running!"}
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
