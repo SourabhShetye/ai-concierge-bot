@@ -23,7 +23,7 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
 
 # ✅ The "Classic" model that works with the 0.3.2 library
-llm = ChatGoogleGenerativeAI(model="gemini-pro", temperature=0, convert_system_message_to_human=True)
+llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0)
 
 # Initialize Bot Instance Globally
 request = HTTPXRequest(connection_pool_size=10, read_timeout=20.0, connect_timeout=20.0)
@@ -149,4 +149,6 @@ async def root():
 # Startup Event to initialize App
 @app.on_event("startup")
 async def on_startup():
+    # In v21+, we just need to initialize, no 'await bot.initialize()' needed manually
     await ptb_app.initialize()
+    await ptb_app.start()  # <--- ADD THIS LINE
