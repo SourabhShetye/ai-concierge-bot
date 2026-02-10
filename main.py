@@ -19,7 +19,7 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 # UPDATE THIS WITH YOUR NEW NGROK URL
-WEBHOOK_URL = "https://95b0-86-98-83-162.ngrok-free.app" 
+WEBHOOK_URL = "https://7cce-86-98-83-162.ngrok-free.app" 
 
 # 2. Initialize Clients
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -197,6 +197,10 @@ async def on_startup():
     await ptb_app.initialize()
     await ptb_app.start()
     await ptb_app.bot.set_webhook(f"{WEBHOOK_URL}/webhook")
+
+@app.get("/")
+def home():
+    return {"status": "alive", "message": "Concierge Bot is running"}
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
