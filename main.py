@@ -8,63 +8,53 @@ from supabase import create_client
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.request import HTTPXRequest
-import google.generativeai as genai
+from groq import Groq
 
 # --- 1. CONFIGURATION ---
 load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 # --- 2. SETUP CLIENTS ---
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+groq_client = Groq(api_key=GROQ_API_KEY)
 
-# Configure Google AI
-genai.configure(api_key=GOOGLE_API_KEY)
-
-# --- 3. ROBUST AI FUNCTION ---
+# --- 3. ROBUST AI FUNCTION (GROQ) ---
 async def call_ai(prompt_text):
     """
-    Tries multiple models using the Official SDK.
-    Returns: (text_response, error_message)
+    Calls Groq (Llama 3) for instant responses.
     """
-    # List of models to try in order
-    models_to_try = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-1.0-pro", "gemini-pro"]
-    
-    last_error = None
-
-    for model_name in models_to_try:
-        try:
-            print(f"🔄 Attempting to use: {model_name}")
-            model = genai.GenerativeModel(model_name)
-            
-            # Run in a separate thread to not block Telegram
-            response = await asyncio.to_thread(model.generate_content, prompt_text)
-            
-            if response.text:
-                print(f"✅ Success with {model_name}")
-                return response.text, None
-                
-        except Exception as e:
-            print(f"❌ {model_name} Failed: {e}")
-            last_error = str(e)
-            
-    return None, last_error
+    try:
+        completion = await asyncio.to_thread(
+            groq_client.chat.completions.create,
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": "You are a helpful Restaurant Concierge."},
+                {"role": "user", "content": prompt_text}
+            ],
+            temperature=0,
+            max_tokens=500,
+        )
+        return completion.choices[0].message.content, None
+    except Exception as e:
+        return None, str(e)
 
 # --- 4. LOGIC HANDLERS ---
 
 async def handle_booking(update: Update, user_text: str, rest_id: str):
     extraction_prompt = f"""
-    Extract booking details from: "{user_text}"
+    Extract booking details from this text: "{user_text}"
     Current Date: {datetime.now().strftime("%Y-%m-%d")}
     
-    Return JSON ONLY (no markdown):
+    Return ONLY a JSON object with this format (no markdown, no extra text):
     {{
       "valid": true,
       "date": "YYYY-MM-DD",
       "time": "HH:MM",
-      "guests": 2
+      "guests": 2,
+      "missing_info": "Ask for missing info"
     }}
     """
     
@@ -72,16 +62,22 @@ async def handle_booking(update: Update, user_text: str, rest_id: str):
     response_text, error = await call_ai(extraction_prompt)
     
     if error:
-        # 🚨 DEBUG MODE: Show the user exactly why it failed
-        await update.message.reply_text(f"⚠️ **System Error:** Google refused the connection.\n\nError details: `{error}`")
+        await update.message.reply_text("📉 System is updating. Please try again in 1 minute.")
         return
 
     try:
+        # Clean JSON (Groq sometimes adds text)
         clean_json = response_text.replace("```json", "").replace("```", "").strip()
+        # Find the first { and last }
+        start = clean_json.find("{")
+        end = clean_json.rfind("}") + 1
+        if start != -1 and end != -1:
+            clean_json = clean_json[start:end]
+            
         details = json.loads(clean_json)
         
         if not details.get("valid"):
-            await update.message.reply_text("I couldn't understand the details. Please provide Date, Time, and Number of People.")
+            await update.message.reply_text(details.get("missing_info", "Please provide Date, Time, and Party Size."))
             return
 
         user = update.effective_user
@@ -100,22 +96,33 @@ async def handle_booking(update: Update, user_text: str, rest_id: str):
         await update.message.reply_text(f"✅ **Booking Confirmed!**\n📅 {details['date']} at {details['time']}\n👤 {details['guests']} Guests")
         
     except Exception as e:
-        await update.message.reply_text(f"❌ Database Error: {e}")
+        print(f"DB Error: {e}")
+        await update.message.reply_text("❌ Database Error. Please contact admin.")
 
 async def handle_chat(update: Update, user_text: str, rest_id: str, details: dict):
-    # Fetch Menu
+    # Fetch Menu (Safe Mode - No Embeddings)
     try:
-        res = supabase.table("menu_items").select("content").eq("restaurant_id", rest_id).limit(20).execute()
+        res = supabase.table("menu_items").select("content").eq("restaurant_id", rest_id).limit(15).execute()
         menu = "\n".join([i['content'] for i in res.data])
     except:
-        menu = "Menu unavailable."
+        menu = "Menu currently unavailable."
 
     prompt = f"""
-    You are the concierge for {details['name']}.
-    Menu: {menu}
-    Wifi: {details.get('wifi_password')}
-    User: {user_text}
-    Answer politely.
+    You are the AI Concierge for {details['name']}.
+    
+    MENU:
+    {menu}
+    
+    WIFI PASSWORD: {details.get('wifi_password')}
+    POLICY: {details.get('policy_docs')}
+    
+    USER QUESTION: {user_text}
+    
+    INSTRUCTIONS:
+    - Answer politely and briefly.
+    - If the answer is in the MENU, recommend it.
+    - If asking for WiFi, give the password.
+    - If you don't know, say so.
     """
     
     response_text, error = await call_ai(prompt)
@@ -123,8 +130,7 @@ async def handle_chat(update: Update, user_text: str, rest_id: str, details: dic
     if response_text:
         await update.message.reply_text(response_text)
     else:
-        # 🚨 DEBUG MODE: Show error to user
-        await update.message.reply_text(f"⚠️ **AI Error:** I cannot think right now.\n\nReason: `{error}`")
+        await update.message.reply_text("I'm having trouble thinking right now. Please ask staff.")
 
 # --- 5. TELEGRAM HANDLERS ---
 
@@ -170,7 +176,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_chat(update, text, rest_id, details)
 
 # --- 6. SETUP SERVER ---
-# Initialize Bot
 request = HTTPXRequest(connection_pool_size=10, read_timeout=30.0, connect_timeout=30.0)
 ptb_app = Application.builder().token(TELEGRAM_TOKEN).request(request).build()
 
@@ -190,7 +195,7 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
 
 @app.get("/")
 async def root():
-    return {"status": "Online"}
+    return {"status": "Online", "model": "Groq Llama 3"}
 
 @app.on_event("startup")
 async def on_startup():
