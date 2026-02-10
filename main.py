@@ -1,11 +1,11 @@
 import os
+import google.generativeai as genai
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, BackgroundTasks
 from supabase import create_client
-from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough
+from langchain_core.runnables import RunnablePassthrough, RunnableLambda
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.request import HTTPXRequest
@@ -15,18 +15,25 @@ load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 # 2. Clients
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ✅ FIX: Use "gemini-pro"
-# This is the ONLY model that works with the stable 0.3.2 library.
-# We also enable the system message converter to prevent "role" errors.
-llm = ChatGoogleGenerativeAI(
-    model="gemini-pro", 
-    temperature=0, 
-    convert_system_message_to_human=True
-)
+# ✅ FIX: Configure Google DIRECTLY (Bypassing broken LangChain wrapper)
+genai.configure(api_key=GOOGLE_API_KEY)
+model = genai.GenerativeModel('gemini-1.5-flash')
+
+# Custom function to call Google Native API
+def call_gemini_flash(prompt_object):
+    # LangChain passes a "PromptValue", we need the string
+    prompt_text = prompt_object.to_string()
+    try:
+        response = model.generate_content(prompt_text)
+        return response.text
+    except Exception as e:
+        print(f"Gemini Error: {e}")
+        return "I'm having trouble thinking right now. Please ask staff."
 
 # 3. Initialize Bot
 request = HTTPXRequest(connection_pool_size=10, read_timeout=20.0, connect_timeout=20.0)
@@ -42,18 +49,15 @@ def get_restaurant_details(rest_id):
     return res.data[0] if res.data else None
 
 def retrieve_info(query_text: str, restaurant_id: str):
-    """
-    ✅ SAFE MODE: Direct Database Search
-    """
+    # Safe Mode: Database Search (No Embeddings)
     try:
-        # Grab first 10 items. Crash-proof.
-        res = supabase.table("menu_items").select("content").eq("restaurant_id", restaurant_id).limit(10).execute()
+        res = supabase.table("menu_items").select("content").eq("restaurant_id", restaurant_id).limit(15).execute()
         all_items = [item['content'] for item in res.data]
         return "\n".join(all_items)
     except Exception as e:
         return "Menu information currently unavailable."
 
-# 5. AI Chain
+# 5. AI Chain (Modified for Direct Call)
 template = """
 You are the AI Concierge for {rest_name}.
 Use the Menu Context below to answer the user.
@@ -65,13 +69,14 @@ Menu Context: {context}
 User: {question}
 """
 prompt = PromptTemplate.from_template(template)
+
+# We use RunnableLambda to inject our custom Google call into the chain
 chain = (
     RunnablePassthrough.assign(
         context=lambda x: retrieve_info(x["question"], x["rest_id"]),
     )
     | prompt
-    | llm
-    | StrOutputParser()
+    | RunnableLambda(call_gemini_flash) 
 )
 
 # 6. Telegram Handlers
@@ -108,6 +113,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Run AI
     try:
+        # Note: chain.invoke() is blocking, but fast enough for Flash. 
+        # Using ainvoke wrapper for compatibility.
         response = await chain.ainvoke({
             "question": user_text,
             "rest_id": rest_id,
@@ -116,9 +123,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         })
         await update.message.reply_text(response)
     except Exception as e:
-        # If even this fails, we just print the error and tell the user.
-        print(f"CRITICAL AI ERROR: {e}")
-        await update.message.reply_text("I'm having trouble connecting to my brain. Please ask a waiter.")
+        print(f"Chain Error: {e}")
+        await update.message.reply_text("I'm having trouble thinking right now. Please ask staff.")
 
 ptb_app.add_handler(CommandHandler("start", start))
 ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
