@@ -198,11 +198,12 @@ async def on_startup():
     await ptb_app.start()
     await ptb_app.bot.set_webhook(f"{WEBHOOK_URL}/webhook")
 
-# Health Check Endpoint for UptimeRobot
+# --- Add this block to fix the 502/404 Error ---
 @app.get("/")
 @app.head("/")
-def health_check():
-    return {"status": "alive", "message": "Bot is running!"}
+async def root():
+    return {"status": "alive", "message": "Concierge Bot is running"}
+# -----------------------------------------------
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
