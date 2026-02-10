@@ -1,6 +1,8 @@
 import os
+import json
 import httpx
 import asyncio
+from datetime import datetime
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, BackgroundTasks
 from supabase import create_client
@@ -15,111 +17,106 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
-# Global variable to store the working model name
+# Global Model Name Cache
 CURRENT_MODEL_NAME = None
 
 # 2. Clients
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# 3. DYNAMIC MODEL DISCOVERY (The Fix)
+# 3. DYNAMIC MODEL DISCOVERY
 async def find_working_model():
-    """
-    Asks Google which models are actually available for this API Key
-    and picks the first one that works.
-    """
     global CURRENT_MODEL_NAME
     url = f"https://generativelanguage.googleapis.com/v1beta/models?key={GOOGLE_API_KEY}"
-    
     async with httpx.AsyncClient() as client:
         try:
             response = await client.get(url, timeout=10.0)
             data = response.json()
+            if "models" not in data: return
             
-            if "models" not in data:
-                print(f"CRITICAL: Could not list models. Response: {data}")
-                return None
-
-            # Look for a model that supports generating content
+            # Prefer flash or pro
             for model in data["models"]:
                 if "generateContent" in model.get("supportedGenerationMethods", []):
-                    # Prefer flash or pro if available, otherwise take anything
-                    name = model["name"] # e.g. "models/gemini-1.0-pro"
+                    name = model["name"]
                     if "flash" in name or "pro" in name:
                         CURRENT_MODEL_NAME = name
-                        print(f"✅ FOUND BEST MODEL: {CURRENT_MODEL_NAME}")
+                        print(f"✅ Using Model: {CURRENT_MODEL_NAME}")
                         return
-                    
-            # If no pro/flash found, just take the first valid one
-            for model in data["models"]:
-                 if "generateContent" in model.get("supportedGenerationMethods", []):
-                     CURRENT_MODEL_NAME = model["name"]
-                     print(f"⚠️ Using fallback model: {CURRENT_MODEL_NAME}")
-                     return
+            # Fallback
+            if data["models"]: CURRENT_MODEL_NAME = data["models"][0]["name"]
+        except: pass
 
-        except Exception as e:
-            print(f"Model Discovery Failed: {e}")
-
-# 4. CUSTOM GENERATION CLIENT
+# 4. CUSTOM AI CLIENT (Direct & Smart)
 async def generate_gemini_response(prompt_text):
     global CURRENT_MODEL_NAME
+    if not CURRENT_MODEL_NAME: await find_working_model()
     
-    # If we haven't found a model yet, try to find one now
-    if not CURRENT_MODEL_NAME:
-        await find_working_model()
-        if not CURRENT_MODEL_NAME:
-            return "Configuration Error: No AI models available for this API Key."
-
-    # Construct URL using the dynamically found model name
-    # CURRENT_MODEL_NAME already includes "models/" prefix (e.g. "models/gemini-pro")
     url = f"https://generativelanguage.googleapis.com/v1beta/{CURRENT_MODEL_NAME}:generateContent?key={GOOGLE_API_KEY}"
-    
     headers = {"Content-Type": "application/json"}
-    payload = {
-        "contents": [{
-            "parts": [{"text": prompt_text}]
-        }]
-    }
+    payload = {"contents": [{"parts": [{"text": prompt_text}]}]}
 
     async with httpx.AsyncClient() as client:
         try:
             response = await client.post(url, json=payload, headers=headers, timeout=15.0)
+            if response.status_code == 404: CURRENT_MODEL_NAME = None # Reset if failed
+            if response.status_code != 200: return None
             
-            if response.status_code != 200:
-                print(f"API Error ({response.status_code}): {response.text}")
-                # If 404 happens again, force re-discovery next time
-                if response.status_code == 404:
-                    CURRENT_MODEL_NAME = None 
-                return "I am currently overloaded. Please ask a staff member."
-
             data = response.json()
-            # Extract text safely
-            try:
-                return data["candidates"][0]["content"]["parts"][0]["text"]
-            except (KeyError, IndexError):
-                return "I couldn't generate a response. Please try again."
-            
-        except Exception as e:
-            print(f"Network Error: {e}")
-            return "I'm having trouble thinking. Please ask staff."
+            return data["candidates"][0]["content"]["parts"][0]["text"]
+        except: return None
 
-# 5. Initialize Bot
-request = HTTPXRequest(connection_pool_size=10, read_timeout=20.0, connect_timeout=20.0)
-ptb_app = Application.builder().token(TELEGRAM_TOKEN).request(request).build()
-
-# 6. Helper Functions
-def get_restaurant_details(rest_id):
-    res = supabase.table("restaurants").select("*").eq("id", rest_id).execute()
-    return res.data[0] if res.data else None
-
-def retrieve_info(restaurant_id: str):
+# 5. BOOKING LOGIC
+async def handle_booking(update: Update, user_text: str, rest_id: str):
+    """
+    Uses AI to extract booking details and save to Supabase.
+    """
+    # 1. Ask AI to extract JSON details
+    extraction_prompt = f"""
+    Extract booking details from this text: "{user_text}"
+    Current Date/Time: {datetime.now().strftime("%Y-%m-%d %H:%M")}
+    
+    Return ONLY a JSON object with these keys:
+    - valid (boolean): true if user specified date, time, AND people.
+    - date (string): YYYY-MM-DD format (infer from "tomorrow", "next friday", etc).
+    - time (string): HH:MM format (24h).
+    - guests (integer): number of people.
+    - missing_info (string): what to ask for if valid is false (e.g. "What time?", "How many people?").
+    
+    Do not add markdown formatting. Just the raw JSON string.
+    """
+    
+    ai_response = await generate_gemini_response(extraction_prompt)
+    
     try:
-        res = supabase.table("menu_items").select("content").eq("restaurant_id", restaurant_id).limit(15).execute()
-        all_items = [item['content'] for item in res.data]
-        return "\n".join(all_items)
-    except Exception as e:
-        return "Menu information currently unavailable."
+        # Clean AI response to ensure valid JSON
+        clean_json = ai_response.replace("```json", "").replace("```", "").strip()
+        details = json.loads(clean_json)
+        
+        if not details.get("valid"):
+            # If details missing, ask the user
+            await update.message.reply_text(details.get("missing_info", "Could you provide the date, time, and party size?"))
+            return
 
-# 7. Telegram Handlers
+        # 2. Save to Supabase
+        user = update.effective_user
+        booking_data = {
+            "user_id": user.id,
+            "restaurant_id": rest_id,
+            "booking_time": f"{details['date']}T{details['time']}:00",
+            "party_size": details['guests'],
+            "status": "confirmed",
+            "customer_name": user.full_name or user.username or "Guest"
+        }
+        
+        supabase.table("bookings").insert(booking_data).execute()
+        
+        # 3. Confirm
+        await update.message.reply_text(f"✅ Booking Confirmed!\n📅 Date: {details['date']}\n⏰ Time: {details['time']}\n👥 Guests: {details['guests']}")
+        
+    except Exception as e:
+        print(f"Booking Error: {e}")
+        await update.message.reply_text("I understood you want to book, but I need the Date, Time, and Number of People clearly stated.")
+
+# 6. Telegram Handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     args = context.args
@@ -127,17 +124,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("👋 Please scan a restaurant QR code to start.")
         return
     rest_id = args[0]
-    details = get_restaurant_details(rest_id)
+    
+    # Get Restaurant
+    res = supabase.table("restaurants").select("*").eq("id", rest_id).execute()
+    details = res.data[0] if res.data else None
+    
     if not details:
         await update.message.reply_text("❌ Restaurant not found.")
         return
+        
     supabase.table("user_sessions").upsert({"user_id": user_id, "current_restaurant_id": rest_id}).execute()
-    await update.message.reply_text(f"👋 Welcome to {details['name']}! How can I help?")
+    await update.message.reply_text(f"👋 Welcome to {details['name']}! Ask me about the menu or say 'Book a table'.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_text = update.message.text
     
+    # Get Session
     res = supabase.table("user_sessions").select("current_restaurant_id").eq("user_id", user_id).execute()
     rest_id = res.data[0]['current_restaurant_id'] if res.data else None
 
@@ -145,35 +148,37 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Please scan a QR code first.")
         return
 
-    # Direct Reply for WiFi (Fastest)
-    if "wifi" in user_text.lower():
-        details = get_restaurant_details(rest_id)
-        await update.message.reply_text(f"📶 WiFi Password: {details.get('wifi_password', 'Ask staff')}")
+    # Check for Booking Intent
+    keywords = ["book", "reserve", "table", "reservation", "booking"]
+    if any(k in user_text.lower() for k in keywords):
+        await handle_booking(update, user_text, rest_id)
         return
 
-    # AI Processing
-    details = get_restaurant_details(rest_id)
-    menu_context = retrieve_info(rest_id)
-    policy_info = f"WiFi: {details.get('wifi_password')}. Docs: {details.get('policy_docs')}"
+    # Normal Chat / Menu Query
+    # Get Menu items (First 15 items safely)
+    try:
+        menu_res = supabase.table("menu_items").select("content").eq("restaurant_id", rest_id).limit(15).execute()
+        menu_context = "\n".join([item['content'] for item in menu_res.data])
+    except:
+        menu_context = "Menu currently unavailable."
 
     prompt = f"""
-    You are the AI Concierge for {details['name']}.
-    Use the Menu Context below to answer the user.
-    If the answer isn't in the menu, be polite and say you don't know.
-
-    Restaurant Policy/WiFi: {policy_info}
-    Menu Context: {menu_context}
-
+    You are the AI Concierge.
+    Context: {menu_context}
     User: {user_text}
+    Answer politely. If answer not in context, say so.
     """
-
-    ai_reply = await generate_gemini_response(prompt)
-    await update.message.reply_text(ai_reply)
+    
+    response = await generate_gemini_response(prompt)
+    if response:
+        await update.message.reply_text(response)
+    else:
+        await update.message.reply_text("I'm having trouble thinking. Please ask staff.")
 
 ptb_app.add_handler(CommandHandler("start", start))
 ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-# 8. FastAPI App
+# 7. FastAPI App
 app = FastAPI()
 
 async def process_telegram_update(data: dict):
@@ -198,5 +203,4 @@ async def root():
 async def on_startup():
     await ptb_app.initialize()
     await ptb_app.start()
-    # Trigger model discovery immediately
     await find_working_model()
