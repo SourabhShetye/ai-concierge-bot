@@ -21,7 +21,8 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 # Clients
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
-# ✅ This model is supported everywhere
+
+# ✅ Stable Model Name for this library version
 llm = ChatGoogleGenerativeAI(model="gemini-pro", temperature=0)
 
 # Initialize Bot Instance Globally
