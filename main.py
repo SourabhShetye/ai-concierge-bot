@@ -17,13 +17,17 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
-# Global Model Name Cache
+# Global variables
 CURRENT_MODEL_NAME = None
 
-# 2. Clients
+# 2. Initialize Clients
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# 3. DYNAMIC MODEL DISCOVERY
+# ✅ CRITICAL FIX: Initialize Bot Application HERE (Global Scope)
+request = HTTPXRequest(connection_pool_size=10, read_timeout=20.0, connect_timeout=20.0)
+ptb_app = Application.builder().token(TELEGRAM_TOKEN).request(request).build()
+
+# 3. DYNAMIC MODEL DISCOVERY (Auto-Fixes 404 Errors)
 async def find_working_model():
     global CURRENT_MODEL_NAME
     url = f"https://generativelanguage.googleapis.com/v1beta/models?key={GOOGLE_API_KEY}"
@@ -33,25 +37,26 @@ async def find_working_model():
             data = response.json()
             if "models" not in data: return
             
-            # Prefer flash or pro
+            # Prefer flash or pro models
             for model in data["models"]:
                 if "generateContent" in model.get("supportedGenerationMethods", []):
                     name = model["name"]
                     if "flash" in name or "pro" in name:
                         CURRENT_MODEL_NAME = name
-                        print(f"✅ Using Model: {CURRENT_MODEL_NAME}")
+                        print(f"✅ Found Model: {CURRENT_MODEL_NAME}")
                         return
-            # Fallback
-            if data["models"]: CURRENT_MODEL_NAME = data["models"][0]["name"]
+            # Fallback to any working model
+            if data["models"]: 
+                CURRENT_MODEL_NAME = data["models"][0]["name"]
+                print(f"⚠️ Using Fallback Model: {CURRENT_MODEL_NAME}")
         except Exception as e:
             print(f"Discovery Error: {e}")
 
-# 4. CUSTOM AI CLIENT (With Retry & Error Handling)
+# 4. CUSTOM AI CLIENT (With Retries & Null Checks)
 async def generate_gemini_response(prompt_text, retries=2):
     global CURRENT_MODEL_NAME
     if not CURRENT_MODEL_NAME: await find_working_model()
     
-    # If discovery failed completely, return None
     if not CURRENT_MODEL_NAME: 
         print("❌ No AI Model Found.")
         return None
@@ -65,12 +70,12 @@ async def generate_gemini_response(prompt_text, retries=2):
             try:
                 response = await client.post(url, json=payload, headers=headers, timeout=15.0)
                 
-                # If 404, force re-discovery
+                # If 404, force re-discovery and retry
                 if response.status_code == 404: 
                     print("⚠️ Model 404. Re-discovering...")
                     await find_working_model()
                     url = f"https://generativelanguage.googleapis.com/v1beta/{CURRENT_MODEL_NAME}:generateContent?key={GOOGLE_API_KEY}"
-                    continue # Try again
+                    continue 
 
                 # If successful
                 if response.status_code == 200:
@@ -79,7 +84,6 @@ async def generate_gemini_response(prompt_text, retries=2):
                 
                 # If rate limited (429), wait and retry
                 if response.status_code == 429:
-                    print("⚠️ Rate Limited. Waiting 2s...")
                     await asyncio.sleep(2)
                     continue
 
@@ -88,9 +92,9 @@ async def generate_gemini_response(prompt_text, retries=2):
             except Exception as e:
                 print(f"⚠️ Network Exception: {e}")
         
-    return None # Give up after retries
+    return None
 
-# 5. BOOKING LOGIC (With Null Check)
+# 5. BOOKING LOGIC
 async def handle_booking(update: Update, user_text: str, rest_id: str):
     extraction_prompt = f"""
     Extract booking details from: "{user_text}"
@@ -108,9 +112,8 @@ async def handle_booking(update: Update, user_text: str, rest_id: str):
     
     ai_response = await generate_gemini_response(extraction_prompt)
     
-    # ✅ FIX: Handle the case where AI fails
     if not ai_response:
-        await update.message.reply_text("📉 My brain is a bit overloaded. Please try booking again in 10 seconds.")
+        await update.message.reply_text("📉 System overloaded. Please try again.")
         return
 
     try:
@@ -121,7 +124,6 @@ async def handle_booking(update: Update, user_text: str, rest_id: str):
             await update.message.reply_text(details.get("missing_info", "I need Date, Time, and Number of People."))
             return
 
-        # Save to Supabase
         user = update.effective_user
         
         booking_data = {
@@ -133,18 +135,20 @@ async def handle_booking(update: Update, user_text: str, rest_id: str):
             "status": "confirmed"
         }
         
-        print(f"DEBUG: Sending Data -> {booking_data}")
+        # Save to DB
         supabase.table("bookings").insert(booking_data).execute()
         
         await update.message.reply_text(f"✅ Booking Confirmed!\n👤 Name: {user.full_name}\n📅 Date: {details['date']}\n⏰ Time: {details['time']}\n👥 Guests: {details['guests']}")
         
     except Exception as e:
-        print(f"CRITICAL DB ERROR: {e}")
+        print(f"DB Error: {e}")
         error_msg = str(e)
         if "policy" in error_msg:
-            await update.message.reply_text("❌ Permission Error: Please Disable RLS in Supabase.")
+            await update.message.reply_text("❌ Database Permission Error. Please Disable RLS in Supabase.")
+        elif "foreign key" in error_msg:
+            await update.message.reply_text("❌ Error: Invalid Restaurant ID.")
         else:
-            await update.message.reply_text(f"❌ System Error: {error_msg}")
+            await update.message.reply_text("❌ Booking Failed. Please check with staff.")
 
 # 6. Telegram Handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -155,7 +159,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     rest_id = args[0]
     
-    # Get Restaurant
     res = supabase.table("restaurants").select("*").eq("id", rest_id).execute()
     details = res.data[0] if res.data else None
     
@@ -170,7 +173,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_text = update.message.text
     
-    # Get Session
     res = supabase.table("user_sessions").select("current_restaurant_id").eq("user_id", user_id).execute()
     rest_id = res.data[0]['current_restaurant_id'] if res.data else None
 
@@ -178,24 +180,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Please scan a QR code first.")
         return
 
-    # Check for Booking Intent (Expanded Keywords)
+    # Check for keywords
     keywords = ["book", "reserve", "table", "reservation", "booking", "party", "seat", "slot"]
     if any(k in user_text.lower() for k in keywords):
         await handle_booking(update, user_text, rest_id)
         return
 
-    # Normal Chat / Menu Query
+    # Menu Search
     try:
         menu_res = supabase.table("menu_items").select("content").eq("restaurant_id", rest_id).limit(15).execute()
         menu_context = "\n".join([item['content'] for item in menu_res.data])
     except:
-        menu_context = "Menu currently unavailable."
+        menu_context = "Menu unavailable."
 
     prompt = f"""
-    You are the AI Concierge for this restaurant.
+    You are the AI Concierge.
     Context: {menu_context}
     User: {user_text}
-    Answer politely. If the user asks for a reservation, tell them to say "Book a table".
+    Answer politely.
     """
     
     response = await generate_gemini_response(prompt)
@@ -204,6 +206,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("I'm having trouble thinking right now. Please ask staff.")
 
+# Register Handlers
 ptb_app.add_handler(CommandHandler("start", start))
 ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
