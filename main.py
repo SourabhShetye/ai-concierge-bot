@@ -2,7 +2,7 @@ import os
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, BackgroundTasks
 from supabase import create_client
-from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
@@ -18,10 +18,10 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 # 2. Clients
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
 
-# ✅ "gemini-pro" is the only model guaranteed to work with this library version
-llm = ChatGoogleGenerativeAI(model="gemini-pro", temperature=0, convert_system_message_to_human=True)
+# ✅ FIX: Using Standard Flash Model. 
+# We REMOVED the "embeddings" client entirely to stop the 404 crashes.
+llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0)
 
 # 3. Initialize Bot
 request = HTTPXRequest(connection_pool_size=10, read_timeout=20.0, connect_timeout=20.0)
@@ -37,24 +37,23 @@ def get_restaurant_details(rest_id):
     return res.data[0] if res.data else None
 
 def retrieve_info(query_text: str, restaurant_id: str):
-    if any(k in query_text.lower() for k in ["full menu", "all dishes"]):
-        res = supabase.table("menu_items").select("content").eq("restaurant_id", restaurant_id).limit(20).execute()
-        return "\n".join([item['content'] for item in res.data])
-
-    vector = embeddings.embed_query(query_text)
-    res = supabase.rpc("match_menu_items_v2", {
-        "query_embedding": vector,
-        "filter_restaurant_id": restaurant_id,
-        "match_threshold": 0.5,
-        "match_count": 5
-    }).execute()
-    return "\n".join([item['content'] for item in res.data]) if res.data else "No specific info found."
+    """
+    ✅ SAFE MODE: Direct Database Search (No AI Embeddings)
+    This prevents the '404 Embedding Not Found' crash.
+    """
+    try:
+        # Just grab the first 10 items from the menu. Simple and crash-proof.
+        res = supabase.table("menu_items").select("content").eq("restaurant_id", restaurant_id).limit(10).execute()
+        all_items = [item['content'] for item in res.data]
+        return "\n".join(all_items)
+    except Exception as e:
+        return "Menu information currently unavailable."
 
 # 5. AI Chain
 template = """
 You are the AI Concierge for {rest_name}.
-Use the Context below to answer the user.
-If asking for WiFi, use the policy data.
+Use the Menu Context below to answer the user.
+If the answer isn't in the menu, be polite and say you don't know.
 
 Restaurant Policy/WiFi: {policy}
 Menu Context: {context}
@@ -104,13 +103,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     policy_info = f"WiFi: {details.get('wifi_password')}. Docs: {details.get('policy_docs')}"
     
     # Run AI
-    response = await chain.ainvoke({
-        "question": user_text,
-        "rest_id": rest_id,
-        "rest_name": details['name'],
-        "policy": policy_info
-    })
-    await update.message.reply_text(response)
+    try:
+        response = await chain.ainvoke({
+            "question": user_text,
+            "rest_id": rest_id,
+            "rest_name": details['name'],
+            "policy": policy_info
+        })
+        await update.message.reply_text(response)
+    except Exception as e:
+        await update.message.reply_text("I'm having trouble thinking right now. Please ask staff.")
 
 ptb_app.add_handler(CommandHandler("start", start))
 ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
@@ -119,7 +121,6 @@ ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_messa
 app = FastAPI()
 
 async def process_telegram_update(data: dict):
-    # Just process the update using the global app instance
     try:
         update = Update.de_json(data, ptb_app.bot)
         await ptb_app.process_update(update)
@@ -139,6 +140,5 @@ async def root():
 
 @app.on_event("startup")
 async def on_startup():
-    # Initialize the bot once on startup
     await ptb_app.initialize()
     await ptb_app.start()
