@@ -2,7 +2,7 @@ import os
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, BackgroundTasks
 from supabase import create_client
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
@@ -19,41 +19,46 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 # 2. Clients
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ✅ FIX: Using Standard Flash Model. 
-# We REMOVED the "embeddings" client entirely to stop the 404 crashes.
+# ✅ FIX 1: Use the MODERN Embedding Model (Stable in Cloud)
+embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
+
+# ✅ FIX 2: Use Flash 1.5 (Fast & Smart)
 llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0)
 
 # 3. Initialize Bot
 request = HTTPXRequest(connection_pool_size=10, read_timeout=20.0, connect_timeout=20.0)
 ptb_app = Application.builder().token(TELEGRAM_TOKEN).request(request).build()
 
-# 4. Helper Functions
-def get_user_restaurant(user_id):
-    response = supabase.table("user_sessions").select("current_restaurant_id").eq("user_id", user_id).execute()
-    return response.data[0]['current_restaurant_id'] if response.data else None
-
+# 4. Smart Retrieval Function
 def get_restaurant_details(rest_id):
     res = supabase.table("restaurants").select("*").eq("id", rest_id).execute()
     return res.data[0] if res.data else None
 
 def retrieve_info(query_text: str, restaurant_id: str):
-    """
-    ✅ SAFE MODE: Direct Database Search (No AI Embeddings)
-    This prevents the '404 Embedding Not Found' crash.
-    """
+    # Search 1: Specific Menu Request
+    if any(k in query_text.lower() for k in ["full menu", "all dishes"]):
+        res = supabase.table("menu_items").select("content").eq("restaurant_id", restaurant_id).limit(20).execute()
+        return "\n".join([item['content'] for item in res.data])
+
+    # Search 2: AI Vector Search (Smart)
     try:
-        # Just grab the first 10 items from the menu. Simple and crash-proof.
-        res = supabase.table("menu_items").select("content").eq("restaurant_id", restaurant_id).limit(10).execute()
-        all_items = [item['content'] for item in res.data]
-        return "\n".join(all_items)
+        vector = embeddings.embed_query(query_text)
+        res = supabase.rpc("match_menu_items_v2", {
+            "query_embedding": vector,
+            "filter_restaurant_id": restaurant_id,
+            "match_threshold": 0.5,
+            "match_count": 5
+        }).execute()
+        return "\n".join([item['content'] for item in res.data]) if res.data else "No specific info found."
     except Exception as e:
-        return "Menu information currently unavailable."
+        print(f"Embedding Error: {e}")
+        return "I'm having trouble searching the menu deeply, but I'm here to help!"
 
 # 5. AI Chain
 template = """
 You are the AI Concierge for {rest_name}.
-Use the Menu Context below to answer the user.
-If the answer isn't in the menu, be polite and say you don't know.
+Answer the User's question using the Menu Context below.
+If the answer is not in the context, politely say you don't know.
 
 Restaurant Policy/WiFi: {policy}
 Menu Context: {context}
@@ -89,43 +94,43 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_text = update.message.text
     
-    rest_id = get_user_restaurant(user_id)
+    # Get user session
+    res = supabase.table("user_sessions").select("current_restaurant_id").eq("user_id", user_id).execute()
+    rest_id = res.data[0]['current_restaurant_id'] if res.data else None
+
     if not rest_id:
         await update.message.reply_text("⚠️ Please scan a QR code first.")
         return
 
+    # Check for simple keywords
     if "wifi" in user_text.lower():
         details = get_restaurant_details(rest_id)
         await update.message.reply_text(f"📶 WiFi Password: {details.get('wifi_password', 'Ask staff')}")
         return
 
+    # Run Smart AI
     details = get_restaurant_details(rest_id)
     policy_info = f"WiFi: {details.get('wifi_password')}. Docs: {details.get('policy_docs')}"
     
-    # Run AI
-    try:
-        response = await chain.ainvoke({
-            "question": user_text,
-            "rest_id": rest_id,
-            "rest_name": details['name'],
-            "policy": policy_info
-        })
-        await update.message.reply_text(response)
-    except Exception as e:
-        await update.message.reply_text("I'm having trouble thinking right now. Please ask staff.")
+    response = await chain.ainvoke({
+        "question": user_text,
+        "rest_id": rest_id,
+        "rest_name": details['name'],
+        "policy": policy_info
+    })
+    await update.message.reply_text(response)
 
 ptb_app.add_handler(CommandHandler("start", start))
 ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-# 7. FastAPI App
+# 7. Server
 app = FastAPI()
 
 async def process_telegram_update(data: dict):
-    try:
+    async with ptb_app:
+        await ptb_app.initialize()
         update = Update.de_json(data, ptb_app.bot)
         await ptb_app.process_update(update)
-    except Exception as e:
-        print(f"Update Error: {e}")
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
@@ -141,4 +146,3 @@ async def root():
 @app.on_event("startup")
 async def on_startup():
     await ptb_app.initialize()
-    await ptb_app.start()
