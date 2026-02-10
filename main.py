@@ -18,10 +18,12 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 # 2. Clients
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
 
-# ✅ "gemini-pro" is the only model guaranteed to work with this library version
-llm = ChatGoogleGenerativeAI(model="gemini-pro", temperature=0, convert_system_message_to_human=True)
+# ✅ FIX 1: Use the NEW Embedding Model (The old one is 404/Dead)
+embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
+
+# ✅ FIX 2: Use the Modern Flash Model (Faster & supported by new libs)
+llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0)
 
 # 3. Initialize Bot
 request = HTTPXRequest(connection_pool_size=10, read_timeout=20.0, connect_timeout=20.0)
@@ -41,7 +43,9 @@ def retrieve_info(query_text: str, restaurant_id: str):
         res = supabase.table("menu_items").select("content").eq("restaurant_id", restaurant_id).limit(20).execute()
         return "\n".join([item['content'] for item in res.data])
 
+    # AI Embedding Search
     vector = embeddings.embed_query(query_text)
+    
     res = supabase.rpc("match_menu_items_v2", {
         "query_embedding": vector,
         "filter_restaurant_id": restaurant_id,
@@ -119,7 +123,6 @@ ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_messa
 app = FastAPI()
 
 async def process_telegram_update(data: dict):
-    # Just process the update using the global app instance
     try:
         update = Update.de_json(data, ptb_app.bot)
         await ptb_app.process_update(update)
@@ -139,6 +142,5 @@ async def root():
 
 @app.on_event("startup")
 async def on_startup():
-    # Initialize the bot once on startup
     await ptb_app.initialize()
     await ptb_app.start()
