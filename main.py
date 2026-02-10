@@ -17,17 +17,13 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
-# Global Cache for Model Name
+# Global Model Name Cache
 CURRENT_MODEL_NAME = None
 
 # 2. Clients
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-request = HTTPXRequest(connection_pool_size=10, read_timeout=20.0, connect_timeout=20.0)
 
-# ✅ FIX 1: Initialize App GLOBALLY at the top to prevent NameError
-ptb_app = Application.builder().token(TELEGRAM_TOKEN).request(request).build()
-
-# 3. DYNAMIC MODEL DISCOVERY (Fixes 404 Errors)
+# 3. DYNAMIC MODEL DISCOVERY
 async def find_working_model():
     global CURRENT_MODEL_NAME
     url = f"https://generativelanguage.googleapis.com/v1beta/models?key={GOOGLE_API_KEY}"
@@ -37,51 +33,65 @@ async def find_working_model():
             data = response.json()
             if "models" not in data: return
             
-            # Prefer 'flash' or 'pro'
+            # Prefer flash or pro
             for model in data["models"]:
                 if "generateContent" in model.get("supportedGenerationMethods", []):
                     name = model["name"]
                     if "flash" in name or "pro" in name:
                         CURRENT_MODEL_NAME = name
-                        print(f"✅ Auto-Selected Model: {CURRENT_MODEL_NAME}")
+                        print(f"✅ Using Model: {CURRENT_MODEL_NAME}")
                         return
             # Fallback
             if data["models"]: CURRENT_MODEL_NAME = data["models"][0]["name"]
         except Exception as e:
-            print(f"Model Discovery Error: {e}")
+            print(f"Discovery Error: {e}")
 
-# 4. CUSTOM AI CLIENT (Direct & Smart)
-async def generate_gemini_response(prompt_text):
+# 4. CUSTOM AI CLIENT (With Retry & Error Handling)
+async def generate_gemini_response(prompt_text, retries=2):
     global CURRENT_MODEL_NAME
     if not CURRENT_MODEL_NAME: await find_working_model()
+    
+    # If discovery failed completely, return None
+    if not CURRENT_MODEL_NAME: 
+        print("❌ No AI Model Found.")
+        return None
     
     url = f"https://generativelanguage.googleapis.com/v1beta/{CURRENT_MODEL_NAME}:generateContent?key={GOOGLE_API_KEY}"
     headers = {"Content-Type": "application/json"}
     payload = {"contents": [{"parts": [{"text": prompt_text}]}]}
 
     async with httpx.AsyncClient() as client:
-        try:
-            response = await client.post(url, json=payload, headers=headers, timeout=15.0)
-            
-            # If 404, force rediscovery next time
-            if response.status_code == 404: 
-                CURRENT_MODEL_NAME = None
-                return "I'm re-calibrating. Please ask again in a moment."
+        for attempt in range(retries + 1):
+            try:
+                response = await client.post(url, json=payload, headers=headers, timeout=15.0)
                 
-            if response.status_code != 200: 
-                print(f"API Error: {response.text}")
-                return None
-            
-            data = response.json()
-            return data["candidates"][0]["content"]["parts"][0]["text"]
-        except Exception as e:
-            print(f"AI Error: {e}")
-            return None
+                # If 404, force re-discovery
+                if response.status_code == 404: 
+                    print("⚠️ Model 404. Re-discovering...")
+                    await find_working_model()
+                    url = f"https://generativelanguage.googleapis.com/v1beta/{CURRENT_MODEL_NAME}:generateContent?key={GOOGLE_API_KEY}"
+                    continue # Try again
 
-# 5. BOOKING LOGIC
-# Updated Booking Logic with DEBUGGING
+                # If successful
+                if response.status_code == 200:
+                    data = response.json()
+                    return data["candidates"][0]["content"]["parts"][0]["text"]
+                
+                # If rate limited (429), wait and retry
+                if response.status_code == 429:
+                    print("⚠️ Rate Limited. Waiting 2s...")
+                    await asyncio.sleep(2)
+                    continue
+
+                print(f"⚠️ API Error {response.status_code}: {response.text}")
+
+            except Exception as e:
+                print(f"⚠️ Network Exception: {e}")
+        
+    return None # Give up after retries
+
+# 5. BOOKING LOGIC (With Null Check)
 async def handle_booking(update: Update, user_text: str, rest_id: str):
-    # 1. AI Extraction
     extraction_prompt = f"""
     Extract booking details from: "{user_text}"
     Current Date: {datetime.now().strftime("%Y-%m-%d")}
@@ -98,6 +108,11 @@ async def handle_booking(update: Update, user_text: str, rest_id: str):
     
     ai_response = await generate_gemini_response(extraction_prompt)
     
+    # ✅ FIX: Handle the case where AI fails
+    if not ai_response:
+        await update.message.reply_text("📉 My brain is a bit overloaded. Please try booking again in 10 seconds.")
+        return
+
     try:
         clean_json = ai_response.replace("```json", "").replace("```", "").strip()
         details = json.loads(clean_json)
@@ -106,29 +121,30 @@ async def handle_booking(update: Update, user_text: str, rest_id: str):
             await update.message.reply_text(details.get("missing_info", "I need Date, Time, and Number of People."))
             return
 
-        # 2. Save to Supabase (Exact Column Match)
+        # Save to Supabase
         user = update.effective_user
         
         booking_data = {
-            "restaurant_id": str(rest_id),           # Matches SQL 'restaurant_id'
-            "user_id": str(user.id),                 # Matches SQL 'user_id'
-            "customer_name": user.full_name or "Guest", # Matches SQL 'customer_name'
-            "party_size": int(details['guests']),    # Matches SQL 'party_size'
-            "booking_time": f"{details['date']} {details['time']}", # Matches SQL 'booking_time'
-            "status": "confirmed"                    # Matches SQL 'status'
+            "restaurant_id": str(rest_id),
+            "user_id": str(user.id),
+            "customer_name": user.full_name or "Guest",
+            "party_size": int(details['guests']),
+            "booking_time": f"{details['date']} {details['time']}",
+            "status": "confirmed"
         }
         
-        print(f"DEBUG: Sending Data to DB -> {booking_data}") # Log for Render Console
+        print(f"DEBUG: Sending Data -> {booking_data}")
+        supabase.table("bookings").insert(booking_data).execute()
         
-        # Execute Insert
-        data = supabase.table("bookings").insert(booking_data).execute()
-        
-        # 3. Confirm to User
         await update.message.reply_text(f"✅ Booking Confirmed!\n👤 Name: {user.full_name}\n📅 Date: {details['date']}\n⏰ Time: {details['time']}\n👥 Guests: {details['guests']}")
         
     except Exception as e:
         print(f"CRITICAL DB ERROR: {e}")
-        await update.message.reply_text(f"❌ System Error: {e}")
+        error_msg = str(e)
+        if "policy" in error_msg:
+            await update.message.reply_text("❌ Permission Error: Please Disable RLS in Supabase.")
+        else:
+            await update.message.reply_text(f"❌ System Error: {error_msg}")
 
 # 6. Telegram Handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -139,6 +155,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     rest_id = args[0]
     
+    # Get Restaurant
     res = supabase.table("restaurants").select("*").eq("id", rest_id).execute()
     details = res.data[0] if res.data else None
     
@@ -147,12 +164,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
         
     supabase.table("user_sessions").upsert({"user_id": user_id, "current_restaurant_id": rest_id}).execute()
-    await update.message.reply_text(f"👋 Welcome to {details['name']}! Ask about the menu or say 'Book a table'.")
+    await update.message.reply_text(f"👋 Welcome to {details['name']}! Ask me about the menu or say 'Book a table'.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_text = update.message.text
     
+    # Get Session
     res = supabase.table("user_sessions").select("current_restaurant_id").eq("user_id", user_id).execute()
     rest_id = res.data[0]['current_restaurant_id'] if res.data else None
 
@@ -160,42 +178,36 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Please scan a QR code first.")
         return
 
-    # Check for Booking
-    if any(k in user_text.lower() for k in ["book", "reserve", "table"]):
+    # Check for Booking Intent (Expanded Keywords)
+    keywords = ["book", "reserve", "table", "reservation", "booking", "party", "seat", "slot"]
+    if any(k in user_text.lower() for k in keywords):
         await handle_booking(update, user_text, rest_id)
         return
 
-    # Direct WiFi
-    if "wifi" in user_text.lower():
-        details = supabase.table("restaurants").select("*").eq("id", rest_id).execute().data[0]
-        await update.message.reply_text(f"📶 WiFi: {details.get('wifi_password', 'Ask staff')}")
-        return
-
-    # AI Chat
+    # Normal Chat / Menu Query
     try:
         menu_res = supabase.table("menu_items").select("content").eq("restaurant_id", rest_id).limit(15).execute()
         menu_context = "\n".join([item['content'] for item in menu_res.data])
     except:
-        menu_context = "Menu unavailable."
+        menu_context = "Menu currently unavailable."
 
     prompt = f"""
-    You are the AI Concierge.
-    Menu: {menu_context}
+    You are the AI Concierge for this restaurant.
+    Context: {menu_context}
     User: {user_text}
-    Answer politely.
+    Answer politely. If the user asks for a reservation, tell them to say "Book a table".
     """
     
     response = await generate_gemini_response(prompt)
     if response:
         await update.message.reply_text(response)
     else:
-        await update.message.reply_text("I'm having trouble thinking. Please ask staff.")
+        await update.message.reply_text("I'm having trouble thinking right now. Please ask staff.")
 
-# ✅ FIX 2: Register Handlers AFTER everything is defined
 ptb_app.add_handler(CommandHandler("start", start))
 ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-# 7. FastAPI Server
+# 7. FastAPI App
 app = FastAPI()
 
 async def process_telegram_update(data: dict):
