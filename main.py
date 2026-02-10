@@ -1,5 +1,4 @@
 import os
-import asyncio
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, BackgroundTasks
 from supabase import create_client
@@ -11,24 +10,24 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.request import HTTPXRequest
 
-# 1. Load Config & Global Clients
+# 1. Load Config
 load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-# Clients
+# 2. Clients
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
+embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
 
-# ✅ FIX 1: Use the standard "gemini-pro" which is most stable
-llm = ChatGoogleGenerativeAI(model="gemini-pro", temperature=0)
+# ✅ "gemini-pro" is the only model guaranteed to work with this library version
+llm = ChatGoogleGenerativeAI(model="gemini-pro", temperature=0, convert_system_message_to_human=True)
 
-# Initialize Bot Instance Globally
+# 3. Initialize Bot
 request = HTTPXRequest(connection_pool_size=10, read_timeout=20.0, connect_timeout=20.0)
 ptb_app = Application.builder().token(TELEGRAM_TOKEN).request(request).build()
 
-# 2. CORE LOGIC FUNCTIONS
+# 4. Helper Functions
 def get_user_restaurant(user_id):
     response = supabase.table("user_sessions").select("current_restaurant_id").eq("user_id", user_id).execute()
     return response.data[0]['current_restaurant_id'] if response.data else None
@@ -51,7 +50,7 @@ def retrieve_info(query_text: str, restaurant_id: str):
     }).execute()
     return "\n".join([item['content'] for item in res.data]) if res.data else "No specific info found."
 
-# 3. AI CHAIN
+# 5. AI Chain
 template = """
 You are the AI Concierge for {rest_name}.
 Use the Context below to answer the user.
@@ -72,7 +71,7 @@ chain = (
     | StrOutputParser()
 )
 
-# 4. TELEGRAM HANDLERS
+# 6. Telegram Handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     args = context.args
@@ -104,6 +103,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     details = get_restaurant_details(rest_id)
     policy_info = f"WiFi: {details.get('wifi_password')}. Docs: {details.get('policy_docs')}"
     
+    # Run AI
     response = await chain.ainvoke({
         "question": user_text,
         "rest_id": rest_id,
@@ -112,23 +112,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     })
     await update.message.reply_text(response)
 
-# Register Handlers
 ptb_app.add_handler(CommandHandler("start", start))
 ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-# 5. FASTAPI SERVER
+# 7. FastAPI App
 app = FastAPI()
 
 async def process_telegram_update(data: dict):
-    """
-    ✅ FIX 2: Do NOT use 'async with ptb_app:'. 
-    The app is already running globally. Just process the update directly.
-    """
+    # Just process the update using the global app instance
     try:
         update = Update.de_json(data, ptb_app.bot)
         await ptb_app.process_update(update)
     except Exception as e:
-        print(f"Error processing update: {e}")
+        print(f"Update Error: {e}")
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
@@ -139,11 +135,10 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
 @app.get("/")
 @app.head("/")
 async def root():
-    return {"status": "alive", "message": "Concierge Bot is running"}
+    return {"status": "alive"}
 
-# Startup Event
 @app.on_event("startup")
 async def on_startup():
-    # Initialize and Start the bot ONCE globally
+    # Initialize the bot once on startup
     await ptb_app.initialize()
     await ptb_app.start()
