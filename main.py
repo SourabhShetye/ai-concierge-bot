@@ -23,7 +23,7 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
 
 # ✅ Stable Model Name for this library version
-llm = ChatGoogleGenerativeAI(model="gemini-pro", temperature=0)
+llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0)
 
 # Initialize Bot Instance Globally
 request = HTTPXRequest(connection_pool_size=10, read_timeout=20.0, connect_timeout=20.0)
