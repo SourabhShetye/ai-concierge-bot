@@ -114,76 +114,97 @@ if current_rest_id:
 
     # --- TAB 2: KITCHEN DISPLAY SYSTEM (KDS) ---
     with tab2:
-        st.header("🔥 Live Kitchen & Service")
-        st_autorefresh(interval=10000, limit=None, key="kitchen_refresh")
+        st.header("🔥 Kitchen Display System")
+        
+        # Auto-Refresh every 5 seconds (Crucial for live kitchen)
+        st_autorefresh(interval=5000, limit=None, key="kitchen_refresh")
+        
+        col_a, col_b = st.columns([1, 5])
+        if col_a.button("🔄 Force Refresh"):
+            st.rerun()
 
-        col_a, col_b = st.columns([1, 4])
-        with col_a:
-            if st.button("🔄 Refresh Now"):
-                st.rerun()
-
-        # SECTION A: SERVICE REQUESTS
-        st.subheader("🔔 Service Bells")
-        try:
-            reqs = supabase.table("service_requests").select("*").eq("restaurant_id", current_rest_id).eq("status", "pending").execute()
-            if reqs.data:
-                for req in reqs.data:
-                    with st.container():
-                        c1, c2 = st.columns([4, 1])
-                        c1.warning(f"🚨 **Table {req.get('table_number', '?')}** requests: **{req['request_type'].upper()}**")
-                        if c2.button("✅ Done", key=f"srv_{req['id']}"):
-                            supabase.table("service_requests").update({"status": "completed"}).eq("id", req['id']).execute()
-                            st.toast("Service request cleared!")
-                            time.sleep(0.5)
+        # --- SECTION 1: URGENT CANCELLATION / MODIFICATION REQUESTS ---
+        # Fetch orders where user requested cancel
+        cancel_reqs = supabase.table("orders").select("*").eq("cancellation_status", "requested").execute()
+        
+        if cancel_reqs.data:
+            st.markdown("### 🚨 URGENT: Cancellation Requests")
+            for req in cancel_reqs.data:
+                with st.container(border=True):
+                    c1, c2, c3 = st.columns([2, 2, 1])
+                    with c1:
+                        st.error(f"Table {req.get('table_number', '?')}: {req.get('items')}")
+                        st.caption(f"Order #{req['id']}")
+                    with c2:
+                        st.write("**User Reason:** Changed mind / Modification needed")
+                    with c3:
+                        # APPROVE CANCEL
+                        if st.button("✅ Approve Cancel", key=f"app_{req['id']}"):
+                            # 1. Mark as cancelled
+                            supabase.table("orders").update({
+                                "status": "cancelled", 
+                                "cancellation_status": "approved"
+                            }).eq("id", req['id']).execute()
+                            
+                            # 2. Notify User
+                            send_telegram_msg(req['chat_id'], f"✅ **Request Approved**\nOrder #{req['id']} has been cancelled.")
                             st.rerun()
-            else:
-                st.caption("No active service calls.")
-        except Exception as e:
-            st.error(f"Error loading service requests: {e}")
+                            
+                        # REJECT CANCEL
+                        if st.button("🚫 Reject (Cooking)", key=f"rej_{req['id']}"):
+                            # 1. Update status
+                            supabase.table("orders").update({
+                                "cancellation_status": "rejected"
+                            }).eq("id", req['id']).execute()
+                            
+                            # 2. Notify User
+                            send_telegram_msg(req['chat_id'], f"⚠️ **Request Denied**\nThe kitchen has already started preparing your food.")
+                            st.rerun()
+            st.divider()
 
-        st.divider()
+        # --- SECTION 2: SERVICE BELLS (Waiter / Bill) ---
+        service_reqs = supabase.table("service_requests").select("*").eq("status", "pending").execute()
+        if service_reqs.data:
+            st.markdown("### 🔔 Service Bells")
+            for srv in service_reqs.data:
+                with st.info(f"**Table {srv['table_number']}** wants: {srv['request_type'].upper()}"):
+                    if st.button("✅ Done", key=f"srv_{srv['id']}"):
+                        supabase.table("service_requests").update({"status": "completed"}).eq("id", srv['id']).execute()
+                        st.rerun()
+            st.divider()
 
-        # SECTION B: FOOD ORDERS
-        st.subheader("🥣 Active Orders")
-        try:
-            orders = supabase.table("orders").select("*").eq("restaurant_id", current_rest_id).eq("status", "pending").order("created_at", desc=False).execute()
-            if not orders.data:
-                st.success("Kitchen is clear! No pending orders.")
-            else:
-                for order in orders.data:
-                    is_cancel_requested = order.get('cancellation_status') == 'requested'
-                    with st.container(border=True):
-                        c1, c2, c3 = st.columns([2, 1, 1])
-                        with c1:
-                            st.subheader(f"Table {order.get('table_number', 'Unknown')}")
-                            st.markdown(f"**{order.get('items', 'Unknown Items')}**")
-                            st.caption(f"Customer: {order.get('customer_name', 'Guest')} | ID: #{order['id']}")
-                            if is_cancel_requested:
-                                st.error("🚨 CUSTOMER WANTS TO CANCEL!")
+        # --- SECTION 3: STANDARD PENDING ORDERS ---
+        st.markdown("### 👨‍🍳 Active Orders")
+        # Fetch pending orders that are NOT waiting for cancellation
+        orders = supabase.table("orders").select("*")\
+            .eq("restaurant_id", current_rest_id)\
+            .eq("status", "pending")\
+            .neq("cancellation_status", "requested")\
+            .order("created_at", desc=False)\
+            .execute()
+        
+        if not orders.data:
+            st.success("Kitchen is clear! No pending orders.")
+        else:
+            for order in orders.data:
+                with st.container(border=True):
+                    c1, c2, c3 = st.columns([3, 2, 1])
+                    
+                    with c1:
+                        st.subheader(f"🥣 {order.get('items', 'Unknown')}")
+                        st.caption(f"Order #{order['id']}")
+                    
+                    with c2:
+                        st.write(f"**Table {order.get('table_number', 'Go')}**")
+                        st.write(f"Guest: {order.get('customer_name', 'Guest')}")
                         
-                        with c2:
-                            if is_cancel_requested:
-                                if st.button("👍 Accept", key=f"acc_{order['id']}"):
-                                    supabase.table("orders").update({"status": "cancelled", "cancellation_status": "approved"}).eq("id", order['id']).execute()
-                                    send_telegram_msg(order.get('chat_id'), f"✅ **Cancellation Approved**\nOrder #{order['id']} has been cancelled.")
-                                    st.success("Cancelled & Refunded.")
-                                    st.rerun()
-                                if st.button("👎 Reject", key=f"rej_{order['id']}"):
-                                    supabase.table("orders").update({"cancellation_status": "rejected"}).eq("id", order['id']).execute()
-                                    send_telegram_msg(order.get('chat_id'), f"❌ **Cancellation Rejected**\nThe chef has already started cooking.")
-                                    st.warning("Cancellation rejected.")
-                                    st.rerun()
-                        
-                        with c3:
-                            if st.button("✅ Ready", key=f"rdy_{order['id']}"):
-                                supabase.table("orders").update({"status": "completed"}).eq("id", order['id']).execute()
-                                if order.get('chat_id'):
-                                    send_telegram_msg(order['chat_id'], f"🍽️ **Order Ready!**\nYour food for Table {order.get('table_number')} is coming out now.")
-                                st.success(f"Order #{order['id']} Ready!")
-                                time.sleep(0.5)
-                                st.rerun()
-        except Exception as e:
-            st.error(f"Error fetching orders: {e}")
+                    with c3:
+                        if st.button("✅ Ready", key=f"rdy_{order['id']}"):
+                            # Mark Completed
+                            supabase.table("orders").update({"status": "completed"}).eq("id", order['id']).execute()
+                            # Notify User
+                            send_telegram_msg(order['chat_id'], f"🍽️ **Order Ready!**\nYour food for Table {order['table_number']} is coming out now.")
+                            st.rerun()
 
     # --- TAB 3: LIVE TABLES & BILLING (NEW) ---
     with tab3:
