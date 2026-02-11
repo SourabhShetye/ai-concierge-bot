@@ -9,6 +9,8 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.request import HTTPXRequest
 from groq import Groq
+
+# Import the separate order service
 from order_service import process_order
 
 # --- 1. CONFIGURATION ---
@@ -18,35 +20,40 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# --- 2. SETUP CLIENTS ---
+# --- 2. CLIENTS ---
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-# --- 3. ROBUST AI FUNCTION (GROQ) ---
-async def call_ai(prompt_text, system_role="You are a helpful assistant."):
+# --- 3. HELPER FUNCTIONS ---
+def get_rest_id(user_id):
+    res = supabase.table("user_sessions").select("current_restaurant_id").eq("user_id", user_id).execute()
+    return res.data[0]['current_restaurant_id'] if res.data else None
+
+async def call_groq(prompt, system_role="You are a helpful assistant."):
     try:
         completion = await asyncio.to_thread(
             groq_client.chat.completions.create,
             model="llama-3.3-70b-versatile",
             messages=[
                 {"role": "system", "content": system_role},
-                {"role": "user", "content": prompt_text}
+                {"role": "user", "content": prompt}
             ],
-            temperature=0.3,
+            temperature=0,
             max_tokens=500,
         )
         return completion.choices[0].message.content, None
     except Exception as e:
         return None, str(e)
 
-# --- 4. LOGIC HANDLERS ---
+# --- 4. CORE LOGIC ---
 
 async def handle_booking(update: Update, user_text: str, rest_id: str):
+    # 1. AI Extraction
     extraction_prompt = f"""
-    Extract booking details from this text: "{user_text}"
+    Extract booking details from: "{user_text}"
     Current Date: {datetime.now().strftime("%Y-%m-%d")}
     
-    Return ONLY a JSON object with this format:
+    Return JSON ONLY:
     {{
       "valid": true,
       "date": "YYYY-MM-DD",
@@ -56,7 +63,7 @@ async def handle_booking(update: Update, user_text: str, rest_id: str):
     }}
     """
     
-    response_text, error = await call_ai(extraction_prompt, "You are a JSON extractor.")
+    response_text, error = await call_groq(extraction_prompt, "You are a JSON extractor.")
     
     if error:
         await update.message.reply_text("📉 System busy. Please try again.")
@@ -76,6 +83,7 @@ async def handle_booking(update: Update, user_text: str, rest_id: str):
 
         user = update.effective_user
         
+        # 2. Save to DB
         booking_data = {
             "restaurant_id": str(rest_id),
             "user_id": str(user.id),
@@ -89,45 +97,58 @@ async def handle_booking(update: Update, user_text: str, rest_id: str):
         await update.message.reply_text(f"✅ **Booking Confirmed!**\n📅 {details['date']} at {details['time']}\n👤 {details['guests']} Guests")
         
     except Exception as e:
+        print(f"Booking Error: {e}")
         await update.message.reply_text("❌ Database Error. Please contact admin.")
 
-async def handle_chat(update: Update, user_text: str, rest_id: str, details: dict):
-    # Fetch WHOLE Menu (Limit 100 items)
-    try:
-        res = supabase.table("menu_items").select("content").eq("restaurant_id", rest_id).limit(100).execute()
-        if res.data:
-            menu_list = [f"- {item['content']}" for item in res.data]
-            menu_context = "\n".join(menu_list)
-        else:
-            menu_context = "Menu is currently empty."
-    except:
-        menu_context = "Menu unavailable."
+async def handle_chat(update: Update, user_text: str, rest_id: str):
+    # Fetch details
+    r_res = supabase.table("restaurants").select("*").eq("id", rest_id).execute()
+    details = r_res.data[0]
 
-    system_role = f"""
-    You are the AI Concierge for {details['name']}.
-    
-    RESTAURANT DETAILS:
-    - WiFi Password: {details.get('wifi_password', 'Not available')}
-    - Policies: {details.get('policy_docs', 'Ask staff')}
-    
-    FULL MENU:
-    {menu_context}
-    
-    INSTRUCTIONS:
-    1. Answer based ONLY on the Menu above.
-    2. If user asks for recommendations, scan FULL MENU to find matches.
-    3. If answer is not in menu, say you don't know.
-    4. Keep answers short.
+    # Fetch Menu (Limit 50)
+    try:
+        res = supabase.table("menu_items").select("content").eq("restaurant_id", rest_id).limit(50).execute()
+        menu = "\n".join([i['content'] for i in res.data]) if res.data else "No menu available."
+    except:
+        menu = "Menu unavailable."
+
+    prompt = f"""
+    Role: Concierge for {details['name']}.
+    Menu: {menu}
+    Wifi: {details.get('wifi_password')}
+    User: {user_text}
+    Answer politely and briefly.
     """
     
-    response_text, error = await call_ai(user_text, system_role)
-    
-    if response_text:
-        await update.message.reply_text(response_text)
+    response, error = await call_groq(prompt)
+    if response:
+        await update.message.reply_text(response)
     else:
-        await update.message.reply_text("I'm having trouble thinking right now. Please ask staff.")
+        await update.message.reply_text("I'm having trouble thinking right now.")
 
-# --- 5. TELEGRAM HANDLERS (UPDATED) ---
+# --- 5. GATEKEEPER & ROUTING ---
+
+async def check_and_ask_context(update: Update, context: ContextTypes.DEFAULT_TYPE, required_fields=["name"]):
+    user_id = update.effective_user.id
+    res = supabase.table("user_sessions").select("*").eq("user_id", user_id).execute()
+    
+    if not res.data:
+        await update.message.reply_text("⚠️ Please scan a QR code first.")
+        return False
+    
+    session = res.data[0]
+    
+    if "name" in required_fields and not session.get('customer_name'):
+        context.user_data['awaiting_info'] = 'name'
+        await update.message.reply_text("👋 Welcome! Before we proceed, **what is your name?**")
+        return False
+
+    if "table" in required_fields and not session.get('table_number'):
+        context.user_data['awaiting_info'] = 'table'
+        await update.message.reply_text("🍽️ **What is your Table Number?** (Look for the sticker on the table)")
+        return False
+        
+    return True
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -143,44 +164,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Restaurant not found.")
         return
         
-    details = res.data[0]
+    # Create Session
     supabase.table("user_sessions").upsert({"user_id": user_id, "current_restaurant_id": rest_id}).execute()
+    
+    details = res.data[0]
     await update.message.reply_text(f"👋 Welcome to {details['name']}! How can I help?")
-
-# --- NEW: Context Gatekeeper ---
-async def check_and_ask_context(update: Update, context: ContextTypes.DEFAULT_TYPE, required_fields=["name"]):
-    """
-    Checks if we have Name/Table. If not, sets a flag and asks the user.
-    """
-    user_id = update.effective_user.id
-    
-    # Get Session
-    res = supabase.table("user_sessions").select("*").eq("user_id", user_id).execute()
-    if not res.data:
-        await update.message.reply_text("⚠️ Please scan a QR code first.")
-        return False
-    
-    session = res.data[0]
-    
-    # 1. Check Name
-    if "name" in required_fields and not session.get('customer_name'):
-        context.user_data['awaiting_info'] = 'name'
-        await update.message.reply_text("👋 Welcome! Before we proceed, **what is your name?**")
-        return False
-
-    # 2. Check Table (Only for Ordering)
-    if "table" in required_fields and not session.get('table_number'):
-        context.user_data['awaiting_info'] = 'table'
-        await update.message.reply_text("🍽️ **What is your Table Number?** (Look for the sticker on the table)")
-        return False
-        
-    return True
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text
     
-    # --- A. INTERCEPT MISSING INFO (The Trap) ---
+    # A. INTERCEPT MISSING INFO
     awaiting = context.user_data.get('awaiting_info')
     
     if awaiting == 'name':
@@ -195,74 +189,84 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Perfect! Table {text} is set. You can now order food.")
         return
 
-    # --- B. REGULAR FLOW ---
-    # Check Session
-    res = supabase.table("user_sessions").select("*").eq("user_id", user_id).execute()
-    if not res.data:
-        await update.message.reply_text("⚠️ Please scan a QR code first.")
-        return
-    
-    session = res.data[0]
-    rest_id = session['current_restaurant_id']
-    
-    # Get Restaurant Details (for Chat)
-    r_res = supabase.table("restaurants").select("*").eq("id", rest_id).execute()
-    details = r_res.data[0]
-    
-    # --- C. ROUTING ---
+    # B. ROUTING
     text_lower = text.lower()
     
-    # 1. Booking Flow (Needs Name Only)
-    booking_keywords = ["book", "reserve", "reservation", "slot"]
-    if any(k in text_lower for k in booking_keywords):
+    # 1. Booking Flow
+    if any(k in text_lower for k in ["book", "reserve", "reservation"]):
         if not await check_and_ask_context(update, context, required_fields=["name"]): return
+        rest_id = get_rest_id(user_id)
         await handle_booking(update, text, rest_id)
         return
 
-    # 2. Ordering Flow (Needs Name AND Table)
-    ordering_keywords = ["order", "have", "eat", "cancel"]
-    if any(k in text_lower for k in ordering_keywords):
+    # 2. Ordering Flow (Needs Name + Table)
+    if any(k in text_lower for k in ["order", "have", "eat", "cancel"]):
         if not await check_and_ask_context(update, context, required_fields=["name", "table"]): return
         
-        reply = await process_order(text, update.effective_user, rest_id, session.get('table_number'), update.message.chat_id)
+        session = supabase.table("user_sessions").select("*").eq("user_id", user_id).single().execute().data
+        
+        # Route to Order Service
+        reply = await process_order(text, update.effective_user, session['current_restaurant_id'], session['table_number'], update.message.chat_id)
         await update.message.reply_text(reply)
         return
 
-    # 3. Service Requests & BILLING (Updated Logic)
-    service_keywords = ["call waiter", "waiter", "bill", "check please", "payment", "pay"]
-    if any(k in text_lower for k in service_keywords):
-        # We definitely need the table number to calculate the bill
+    # 3. Bill Request
+    if "bill" in text_lower or "check please" in text_lower:
         if not await check_and_ask_context(update, context, required_fields=["table"]): return
+        session = supabase.table("user_sessions").select("*").eq("user_id", user_id).single().execute().data
+        t_num = session['table_number']
         
-        table_num = session.get('table_number')
-        
-        # Check if it is a Bill Request or just calling a waiter
-        is_bill_request = "bill" in text_lower or "check" in text_lower or "pay" in text_lower
-        
-        if is_bill_request:
-            # Calculate Total from DB (Sum of unpaid orders for this table)
-            orders = supabase.table("orders").select("price")\
-                .eq("restaurant_id", rest_id)\
-                .eq("table_number", table_num)\
-                .neq("status", "paid")\
-                .execute()
+        orders = supabase.table("orders").select("price").eq("table_number", t_num).neq("status", "paid").execute()
+        if not orders.data:
+            await update.message.reply_text("You have no active orders to pay for.")
+            return
             
-            total_bill = sum(float(o['price']) for o in orders.data) if orders.data else 0.0
-            
-            await update.message.reply_text(f"🧾 **Bill Request Received**\n\nTable: {table_num}\nTotal Due: **${total_bill:.2f}**\n\nA waiter is coming with the payment machine.")
-            req_type = "BILL REQUEST"
-        else:
-            await update.message.reply_text("🔔 **Staff Notified!**\nA waiter will be with you shortly.")
-            req_type = "WAITER CALL"
-
-        # Notify Admin Panel
+        total = sum(float(o['price']) for o in orders.data)
+        await update.message.reply_text(f"🧾 **Your Bill (Table {t_num})**\n\nTotal Due: **${total}**\n\nA waiter is coming with the machine.")
+        
+        # Notify Admin
         supabase.table("service_requests").insert({
-            "restaurant_id": rest_id,
-            "table_number": table_num,
-            "request_type": req_type,
+            "restaurant_id": session['current_restaurant_id'],
+            "table_number": t_num,
+            "request_type": "BILL REQUEST",
             "status": "pending"
         }).execute()
         return
 
-    # 4. Chat Flow (Fallback)
-    await handle_chat(update, text, rest_id, details)
+    # 4. Chat Flow
+    rest_id = get_rest_id(user_id)
+    if rest_id:
+         await handle_chat(update, text, rest_id)
+
+# --- 6. SERVER SETUP ---
+request = HTTPXRequest(connection_pool_size=10, read_timeout=30.0, connect_timeout=30.0)
+ptb_app = Application.builder().token(TELEGRAM_TOKEN).request(request).build()
+
+ptb_app.add_handler(CommandHandler("start", start))
+ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+# ✅ THIS WAS MISSING/OBSCURED BEFORE:
+app = FastAPI()
+
+async def process_telegram_update(data: dict):
+    try:
+        update = Update.de_json(data, ptb_app.bot)
+        await ptb_app.initialize()
+        await ptb_app.process_update(update)
+    except Exception as e:
+        print(f"Update Error: {e}")
+
+@app.post("/webhook")
+async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
+    data = await request.json()
+    background_tasks.add_task(process_telegram_update, data)
+    return {"status": "ok"}
+
+@app.get("/")
+async def root():
+    return {"status": "Online"}
+
+@app.on_event("startup")
+async def on_startup():
+    await ptb_app.initialize()
+    await ptb_app.start()
