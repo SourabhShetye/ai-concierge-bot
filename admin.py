@@ -125,20 +125,21 @@ if current_rest_id:
             
             submit_dish = st.form_submit_button("➕ Add to Menu")
             
+            # ... inside the "Add Dish" form ...
             if submit_dish and dish_name:
                 full_text = f"{dish_name} ({dish_cat}) - {dish_price} - {dish_desc}"
                 try:
-                    with st.spinner("Generating AI Embedding..."):
-                        # ✅ Generates vector using text-embedding-004
-                        vector = embeddings.embed_query(full_text)
-                        
-                        supabase.table("menu_items").insert({
-                            "restaurant_id": current_rest_id,
-                            "content": full_text,
-                            "category": dish_cat,
-                            "embedding": vector
-                        }).execute()
-                        st.success(f"✅ Added {dish_name} to menu!")
+                    # ✅ REMOVED: vector = embeddings.embed_query(full_text)
+                    # We simply leave the embedding field empty/null. 
+                    # The smart bot doesn't need it anymore!
+                    
+                    supabase.table("menu_items").insert({
+                        "restaurant_id": current_rest_id,
+                        "content": full_text,
+                        "category": dish_cat,
+                        # "embedding": vector  <-- No longer needed
+                    }).execute()
+                    st.success(f"✅ Added {dish_name} to menu!")
                 except Exception as e:
                     st.error(f"Failed to add dish: {e}")
 

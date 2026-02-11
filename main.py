@@ -22,19 +22,16 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 groq_client = Groq(api_key=GROQ_API_KEY)
 
 # --- 3. ROBUST AI FUNCTION (GROQ) ---
-async def call_ai(prompt_text):
-    """
-    Calls Groq (Llama 3) for instant responses.
-    """
+async def call_ai(prompt_text, system_role="You are a helpful assistant."):
     try:
         completion = await asyncio.to_thread(
             groq_client.chat.completions.create,
             model="llama-3.3-70b-versatile",
             messages=[
-                {"role": "system", "content": "You are a helpful Restaurant Concierge."},
+                {"role": "system", "content": system_role},
                 {"role": "user", "content": prompt_text}
             ],
-            temperature=0,
+            temperature=0.3, # Slight creativity for natural conversation
             max_tokens=500,
         )
         return completion.choices[0].message.content, None
@@ -48,7 +45,7 @@ async def handle_booking(update: Update, user_text: str, rest_id: str):
     Extract booking details from this text: "{user_text}"
     Current Date: {datetime.now().strftime("%Y-%m-%d")}
     
-    Return ONLY a JSON object with this format (no markdown, no extra text):
+    Return ONLY a JSON object with this format:
     {{
       "valid": true,
       "date": "YYYY-MM-DD",
@@ -58,21 +55,17 @@ async def handle_booking(update: Update, user_text: str, rest_id: str):
     }}
     """
     
-    # Call AI
-    response_text, error = await call_ai(extraction_prompt)
+    response_text, error = await call_ai(extraction_prompt, "You are a JSON extractor.")
     
     if error:
-        await update.message.reply_text("📉 System is updating. Please try again in 1 minute.")
+        await update.message.reply_text("📉 System busy. Please try again.")
         return
 
     try:
-        # Clean JSON (Groq sometimes adds text)
         clean_json = response_text.replace("```json", "").replace("```", "").strip()
-        # Find the first { and last }
         start = clean_json.find("{")
         end = clean_json.rfind("}") + 1
-        if start != -1 and end != -1:
-            clean_json = clean_json[start:end]
+        clean_json = clean_json[start:end]
             
         details = json.loads(clean_json)
         
@@ -82,7 +75,6 @@ async def handle_booking(update: Update, user_text: str, rest_id: str):
 
         user = update.effective_user
         
-        # Save to DB
         booking_data = {
             "restaurant_id": str(rest_id),
             "user_id": str(user.id),
@@ -96,36 +88,41 @@ async def handle_booking(update: Update, user_text: str, rest_id: str):
         await update.message.reply_text(f"✅ **Booking Confirmed!**\n📅 {details['date']} at {details['time']}\n👤 {details['guests']} Guests")
         
     except Exception as e:
-        print(f"DB Error: {e}")
         await update.message.reply_text("❌ Database Error. Please contact admin.")
 
 async def handle_chat(update: Update, user_text: str, rest_id: str, details: dict):
-    # Fetch Menu (Safe Mode - No Embeddings)
+    # ✅ SMART UPGRADE: Fetch WHOLE Menu (Limit 100 items)
+    # Llama 3 has a huge context window, so we can feed it EVERYTHING.
     try:
-        res = supabase.table("menu_items").select("content").eq("restaurant_id", rest_id).limit(15).execute()
-        menu = "\n".join([i['content'] for i in res.data])
+        res = supabase.table("menu_items").select("content").eq("restaurant_id", rest_id).limit(100).execute()
+        if res.data:
+            menu_list = [f"- {item['content']}" for item in res.data]
+            menu_context = "\n".join(menu_list)
+        else:
+            menu_context = "Menu is currently empty."
     except:
-        menu = "Menu currently unavailable."
+        menu_context = "Menu unavailable."
 
-    prompt = f"""
+    # Robust System Prompt
+    system_role = f"""
     You are the AI Concierge for {details['name']}.
+    Your goal is to be helpful, polite, and drive sales.
     
-    MENU:
-    {menu}
+    RESTAURANT DETAILS:
+    - WiFi Password: {details.get('wifi_password', 'Not available')}
+    - Policies: {details.get('policy_docs', 'Ask staff')}
     
-    WIFI PASSWORD: {details.get('wifi_password')}
-    POLICY: {details.get('policy_docs')}
-    
-    USER QUESTION: {user_text}
+    FULL MENU:
+    {menu_context}
     
     INSTRUCTIONS:
-    - Answer politely and briefly.
-    - If the answer is in the MENU, recommend it.
-    - If asking for WiFi, give the password.
-    - If you don't know, say so.
+    1. Answer based ONLY on the Menu above.
+    2. If the user asks for recommendations (e.g., "spicy", "vegan"), scan the FULL MENU to find matches.
+    3. If the answer is not in the menu, apologize and say you don't know.
+    4. Keep answers short (under 3 sentences).
     """
     
-    response_text, error = await call_ai(prompt)
+    response_text, error = await call_ai(user_text, system_role)
     
     if response_text:
         await update.message.reply_text(response_text)
@@ -156,19 +153,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text
     
-    # Check Session
     res = supabase.table("user_sessions").select("current_restaurant_id").eq("user_id", user_id).execute()
     if not res.data:
         await update.message.reply_text("⚠️ Please scan QR code first.")
         return
     
     rest_id = res.data[0]['current_restaurant_id']
-    
-    # Get Rest Details
     r_res = supabase.table("restaurants").select("*").eq("id", rest_id).execute()
     details = r_res.data[0]
 
-    # Router
     keywords = ["book", "reserve", "reservation", "party", "table"]
     if any(k in text.lower() for k in keywords):
         await handle_booking(update, text, rest_id)
