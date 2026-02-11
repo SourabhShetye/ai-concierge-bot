@@ -9,6 +9,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.request import HTTPXRequest
 from groq import Groq
+from order_service import process_order  # <--- Import the new module
 
 # --- 1. CONFIGURATION ---
 load_dotenv()
@@ -149,24 +150,44 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     supabase.table("user_sessions").upsert({"user_id": user_id, "current_restaurant_id": rest_id}).execute()
     await update.message.reply_text(f"👋 Welcome to {details['name']}! How can I help?")
 
+# Make sure to import the new service at the top of main.py
+from order_service import process_order 
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text
     
+    # 1. Check User Session
     res = supabase.table("user_sessions").select("current_restaurant_id").eq("user_id", user_id).execute()
     if not res.data:
-        await update.message.reply_text("⚠️ Please scan QR code first.")
+        await update.message.reply_text("⚠️ Please scan a QR code first.")
         return
     
     rest_id = res.data[0]['current_restaurant_id']
+    
+    # 2. Get Restaurant Details (for Context)
     r_res = supabase.table("restaurants").select("*").eq("id", rest_id).execute()
     details = r_res.data[0]
 
-    keywords = ["book", "reserve", "reservation", "party", "table"]
-    if any(k in text.lower() for k in keywords):
+    # --- ROUTING LOGIC ---
+    text_lower = text.lower()
+
+    # Route A: Booking Intent
+    booking_keywords = ["book", "reserve", "reservation", "party", "table", "slot"]
+    if any(k in text_lower for k in booking_keywords):
         await handle_booking(update, text, rest_id)
-    else:
-        await handle_chat(update, text, rest_id, details)
+        return
+
+    # Route B: Ordering Intent (Traffic to Order Service)
+    ordering_keywords = ["order", "i'll have", "i will have", "want to eat", "bring me", "place order"]
+    if any(k in text_lower for k in ordering_keywords):
+        # We await the separate module to process the order
+        reply = await process_order(text, update.effective_user, rest_id)
+        await update.message.reply_text(reply)
+        return
+
+    # Route C: General Chat / Menu Questions
+    await handle_chat(update, text, rest_id, details)
 
 # --- 6. SETUP SERVER ---
 request = HTTPXRequest(connection_pool_size=10, read_timeout=30.0, connect_timeout=30.0)

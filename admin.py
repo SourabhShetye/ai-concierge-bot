@@ -78,7 +78,7 @@ elif selected_name != "Select...":
 
 # 3. MAIN DASHBOARD
 if current_rest_id:
-    tab1, tab2, tab3 = st.tabs(["📅 Live Bookings", "📜 Menu Management", "⚙️ Settings"])
+    tab1, tab2, tab3, tab4 = st.tabs(["📅 Bookings", "👨‍🍳 Kitchen (Live)", "📜 Menu", "⚙️ Settings"])
 
     # --- TAB 1: BOOKINGS ---
     with tab1:
@@ -111,53 +111,55 @@ if current_rest_id:
         except Exception as e:
             st.error(f"Could not load bookings: {e}")
 
-    # --- TAB 2: MENU ---
+    # --- TAB 2: KITCHEN DISPLAY SYSTEM (KDS) ---
     with tab2:
-        st.subheader("Add New Menu Item")
-        with st.form("add_dish"):
-            col1, col2 = st.columns(2)
-            with col1:
-                dish_name = st.text_input("Dish Name", placeholder="Margherita Pizza")
-                dish_price = st.text_input("Price", placeholder="$12.50")
-            with col2:
-                dish_cat = st.selectbox("Category", ["Starter", "Main", "Dessert", "Drink"])
-                dish_desc = st.text_area("Description", placeholder="Tomato sauce, mozzarella, basil...")
-            
-            submit_dish = st.form_submit_button("➕ Add to Menu")
-            
-            # ... inside the "Add Dish" form ...
-            if submit_dish and dish_name:
-                full_text = f"{dish_name} ({dish_cat}) - {dish_price} - {dish_desc}"
-                try:
-                    # ✅ REMOVED: vector = embeddings.embed_query(full_text)
-                    # We simply leave the embedding field empty/null. 
-                    # The smart bot doesn't need it anymore!
-                    
-                    supabase.table("menu_items").insert({
-                        "restaurant_id": current_rest_id,
-                        "content": full_text,
-                        "category": dish_cat,
-                        # "embedding": vector  <-- No longer needed
-                    }).execute()
-                    st.success(f"✅ Added {dish_name} to menu!")
-                except Exception as e:
-                    st.error(f"Failed to add dish: {e}")
-
-        st.divider()
-        st.subheader("Current Menu Items")
+        st.header("🔥 Live Kitchen Orders")
+        
+        col_a, col_b = st.columns([1, 4])
+        with col_a:
+            if st.button("🔄 Refresh"):
+                st.rerun()
+        
+        # 1. Fetch PENDING orders from Supabase
         try:
-            menu_res = supabase.table("menu_items").select("*").eq("restaurant_id", current_rest_id).execute()
-            if menu_res.data:
-                for item in menu_res.data:
-                    with st.expander(f"{item.get('content', 'Unknown Item')[:50]}..."):
-                        st.write(f"**Full Text:** {item.get('content')}")
-                        if st.button("Delete", key=item['id']):
-                            supabase.table("menu_items").delete().eq("id", item['id']).execute()
-                            st.rerun()
+            orders = supabase.table("orders").select("*")\
+                .eq("restaurant_id", current_rest_id)\
+                .eq("status", "pending")\
+                .order("created_at", desc=False)\
+                .execute()
+            
+            if not orders.data:
+                st.success("✅ All caught up! No pending orders.")
+                st.balloons()
             else:
-                st.info("Menu is empty.")
+                # 2. Display Orders as "Tickets"
+                for order in orders.data:
+                    # Create a "Ticket" styling container
+                    with st.container():
+                        st.markdown("---")
+                        c1, c2, c3 = st.columns([3, 2, 1])
+                        
+                        with c1:
+                            st.subheader(f"🥣 {order.get('items', 'Unknown Items')}")
+                            st.caption(f"Order ID: #{order['id']}")
+                        
+                        with c2:
+                            st.write(f"**Customer:** {order.get('customer_name', 'Guest')}")
+                            # Calculate time elapsed if 'created_at' exists
+                            if 'created_at' in order:
+                                st.caption(f"Time: {order['created_at'].split('T')[1][:5]}")
+                        
+                        with c3:
+                            # The "Done" Button
+                            if st.button("✅ Ready", key=f"btn_{order['id']}"):
+                                # Update DB status to 'completed' or 'delivered'
+                                supabase.table("orders").update({"status": "completed"}).eq("id", order['id']).execute()
+                                st.toast(f"Order #{order['id']} marked complete!")
+                                time.sleep(1) # Small delay for visual feedback
+                                st.rerun()
+                                
         except Exception as e:
-            st.error(f"Error loading menu: {e}")
+            st.error(f"Error fetching orders: {e}")
 
     # --- TAB 3: SETTINGS ---
     with tab3:
