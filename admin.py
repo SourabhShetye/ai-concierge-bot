@@ -6,9 +6,6 @@ import os
 from streamlit_autorefresh import st_autorefresh
 from dotenv import load_dotenv
 from supabase import create_client
-# We keep this import if you rely on it for other parts, 
-# but it's not strictly needed for the Kitchen display anymore.
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
 # 1. SETUP & CONFIG
 st.set_page_config(page_title="Concierge Admin", layout="wide", page_icon="👨‍🍳")
@@ -22,8 +19,6 @@ if not os.getenv("SUPABASE_URL") or not os.getenv("GOOGLE_API_KEY"):
 # Initialize Clients
 try:
     supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
-    # Optional: Embedding model (Left here to avoid breaking existing dependencies)
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
 except Exception as e:
     st.error(f"Connection Error: {e}")
     st.stop()
@@ -96,8 +91,8 @@ elif selected_name != "Select...":
 
 # 3. MAIN DASHBOARD
 if current_rest_id:
-    # We define 4 Tabs now
-    tab1, tab2, tab3, tab4 = st.tabs(["📅 Bookings", "👨‍🍳 Kitchen & Service", "📜 Menu", "⚙️ Settings"])
+    # ✅ UPDATED: Added Tab 3 for Live Tables
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📅 Bookings", "👨‍🍳 Kitchen", "💰 Live Tables", "📜 Menu", "⚙️ Settings"])
 
     # --- TAB 1: BOOKINGS ---
     with tab1:
@@ -109,7 +104,6 @@ if current_rest_id:
             res = supabase.table("bookings").select("*").eq("restaurant_id", current_rest_id).order("created_at", desc=True).execute()
             if res.data:
                 df = pd.DataFrame(res.data)
-                # Ensure columns exist before displaying
                 display_cols = ['customer_name', 'booking_time', 'party_size', 'status']
                 available_cols = [c for c in display_cols if c in df.columns]
                 st.dataframe(df[available_cols], use_container_width=True)
@@ -121,8 +115,6 @@ if current_rest_id:
     # --- TAB 2: KITCHEN DISPLAY SYSTEM (KDS) ---
     with tab2:
         st.header("🔥 Live Kitchen & Service")
-        
-        # AUTO-REFRESH: Reloads every 10 seconds to keep orders live
         st_autorefresh(interval=10000, limit=None, key="kitchen_refresh")
 
         col_a, col_b = st.columns([1, 4])
@@ -130,15 +122,10 @@ if current_rest_id:
             if st.button("🔄 Refresh Now"):
                 st.rerun()
 
-        # SECTION A: SERVICE REQUESTS (Waiter/Bill)
+        # SECTION A: SERVICE REQUESTS
         st.subheader("🔔 Service Bells")
         try:
-            reqs = supabase.table("service_requests")\
-                .select("*")\
-                .eq("restaurant_id", current_rest_id)\
-                .eq("status", "pending")\
-                .execute()
-                
+            reqs = supabase.table("service_requests").select("*").eq("restaurant_id", current_rest_id).eq("status", "pending").execute()
             if reqs.data:
                 for req in reqs.data:
                     with st.container():
@@ -159,82 +146,126 @@ if current_rest_id:
         # SECTION B: FOOD ORDERS
         st.subheader("🥣 Active Orders")
         try:
-            # Fetch orders that are 'pending' (cooking)
-            orders = supabase.table("orders").select("*")\
-                .eq("restaurant_id", current_rest_id)\
-                .eq("status", "pending")\
-                .order("created_at", desc=False)\
-                .execute()
-            
+            orders = supabase.table("orders").select("*").eq("restaurant_id", current_rest_id).eq("status", "pending").order("created_at", desc=False).execute()
             if not orders.data:
                 st.success("Kitchen is clear! No pending orders.")
             else:
                 for order in orders.data:
                     is_cancel_requested = order.get('cancellation_status') == 'requested'
-                    
-                    # Create a card for each order
                     with st.container(border=True):
-                        # Layout: Details | Cancel Controls | Ready Button
                         c1, c2, c3 = st.columns([2, 1, 1])
-                        
-                        # Column 1: Order Details
                         with c1:
                             st.subheader(f"Table {order.get('table_number', 'Unknown')}")
                             st.markdown(f"**{order.get('items', 'Unknown Items')}**")
                             st.caption(f"Customer: {order.get('customer_name', 'Guest')} | ID: #{order['id']}")
-                            
                             if is_cancel_requested:
                                 st.error("🚨 CUSTOMER WANTS TO CANCEL!")
                         
-                        # Column 2: Cancellation Controls
                         with c2:
                             if is_cancel_requested:
-                                # Approve Cancel
                                 if st.button("👍 Accept", key=f"acc_{order['id']}"):
-                                    # 1. Update DB: Cancel the order
-                                    supabase.table("orders").update({
-                                        "status": "cancelled", 
-                                        "cancellation_status": "approved"
-                                    }).eq("id", order['id']).execute()
-                                    
-                                    # 2. Notify User
+                                    supabase.table("orders").update({"status": "cancelled", "cancellation_status": "approved"}).eq("id", order['id']).execute()
                                     send_telegram_msg(order.get('chat_id'), f"✅ **Cancellation Approved**\nOrder #{order['id']} has been cancelled.")
                                     st.success("Cancelled & Refunded.")
                                     st.rerun()
-                                    
-                                # Reject Cancel
                                 if st.button("👎 Reject", key=f"rej_{order['id']}"):
-                                    # 1. Update DB: Reject request
-                                    supabase.table("orders").update({
-                                        "cancellation_status": "rejected"
-                                    }).eq("id", order['id']).execute()
-                                    
-                                    # 2. Notify User
-                                    send_telegram_msg(order.get('chat_id'), f"❌ **Cancellation Rejected**\nThe chef has already started cooking your food.")
+                                    supabase.table("orders").update({"cancellation_status": "rejected"}).eq("id", order['id']).execute()
+                                    send_telegram_msg(order.get('chat_id'), f"❌ **Cancellation Rejected**\nThe chef has already started cooking.")
                                     st.warning("Cancellation rejected.")
                                     st.rerun()
-                            else:
-                                st.info("👨‍🍳 Cooking...")
-
-                        # Column 3: Ready Button
+                        
                         with c3:
                             if st.button("✅ Ready", key=f"rdy_{order['id']}"):
-                                # 1. Update DB: Complete order
                                 supabase.table("orders").update({"status": "completed"}).eq("id", order['id']).execute()
-                                
-                                # 2. Notify User
                                 if order.get('chat_id'):
                                     send_telegram_msg(order['chat_id'], f"🍽️ **Order Ready!**\nYour food for Table {order.get('table_number')} is coming out now.")
-                                
                                 st.success(f"Order #{order['id']} Ready!")
                                 time.sleep(0.5)
                                 st.rerun()
-                                
         except Exception as e:
             st.error(f"Error fetching orders: {e}")
 
-    # --- TAB 3: MENU MANAGEMENT ---
+    # --- TAB 3: LIVE TABLES & BILLING (NEW) ---
     with tab3:
+        st.header("🪑 Active Tables & Billing")
+        
+        if st.button("🔄 Refresh Tables"):
+            st.rerun()
+            
+        # 1. Fetch active orders (status is NOT 'paid')
+        # This includes 'pending' and 'completed' (served but not paid)
+        try:
+            active_orders = supabase.table("orders").select("*")\
+                .eq("restaurant_id", current_rest_id)\
+                .neq("status", "paid")\
+                .execute()
+            
+            if not active_orders.data:
+                st.info("No active tables right now.")
+            else:
+                # 2. Group Orders by Table Number
+                tables = {}
+                for order in active_orders.data:
+                    # Skip cancelled items from the bill
+                    if order.get('status') == 'cancelled':
+                        continue
+                        
+                    t_num = order.get('table_number', 'Unknown')
+                    if t_num not in tables:
+                        tables[t_num] = {
+                            "name": order.get('customer_name', 'Guest'), 
+                            "orders": [], 
+                            "total": 0.0, 
+                            "chat_id": order.get('chat_id')
+                        }
+                    
+                    tables[t_num]["orders"].append(order)
+                    # Safely handle price calculation
+                    price = float(order.get('price', 0)) if order.get('price') else 0.0
+                    tables[t_num]["total"] += price
+
+                # 3. Display Cards
+                cols = st.columns(3)
+                for i, (t_num, data) in enumerate(tables.items()):
+                    with cols[i % 3]:
+                        with st.container(border=True):
+                            st.subheader(f"Table {t_num}")
+                            st.caption(f"Guest: {data['name']}")
+                            st.divider()
+                            
+                            # List Items
+                            for o in data['orders']:
+                                status_icon = "🍳" if o['status'] == 'pending' else "🍽️"
+                                price_disp = f"${o.get('price', 0)}"
+                                st.text(f"{status_icon} {o.get('items', '')[:25]}... ({price_disp})")
+                            
+                            st.divider()
+                            st.markdown(f"### Total: ${round(data['total'], 2)}")
+                            
+                            # BILLING ACTIONS
+                            c1, c2 = st.columns(2)
+                            with c1:
+                                if st.button("🖨️ Send Bill", key=f"bill_{t_num}"):
+                                    msg = f"🧾 **BILL FOR TABLE {t_num}**\n\nTotal Due: **${round(data['total'], 2)}**\n\nPlease pay at the counter or wait for the staff."
+                                    send_telegram_msg(data['chat_id'], msg)
+                                    st.toast("Bill Sent to User!")
+                            
+                            with c2:
+                                if st.button("💰 Mark Paid", key=f"pay_{t_num}"):
+                                    # Mark all orders as paid
+                                    for o in data['orders']:
+                                        supabase.table("orders").update({"status": "paid"}).eq("id", o['id']).execute()
+                                    
+                                    # Send Thank You
+                                    send_telegram_msg(data['chat_id'], "✅ **Payment Received!**\n\nThank you for dining with us! Please rate us ⭐⭐⭐⭐⭐")
+                                    st.success("Table Closed!")
+                                    time.sleep(1)
+                                    st.rerun()
+        except Exception as e:
+            st.error(f"Error loading tables: {e}")
+
+    # --- TAB 4: MENU MANAGEMENT ---
+    with tab4:
         st.subheader("Add New Menu Item")
         with st.form("add_dish"):
             col1, col2 = st.columns(2)
@@ -250,7 +281,6 @@ if current_rest_id:
             if submit_dish and dish_name:
                 full_text = f"{dish_name} ({dish_cat}) - {dish_price} - {dish_desc}"
                 try:
-                    # Insert menu item (Smart bot reads raw text, no embeddings needed)
                     supabase.table("menu_items").insert({
                         "restaurant_id": current_rest_id,
                         "content": full_text,
@@ -276,8 +306,8 @@ if current_rest_id:
         except Exception as e:
             st.error(f"Error loading menu: {e}")
 
-    # --- TAB 4: SETTINGS ---
-    with tab4:
+    # --- TAB 5: SETTINGS ---
+    with tab5:
         st.subheader("Restaurant Configuration")
         try:
             details = supabase.table("restaurants").select("*").eq("id", current_rest_id).single().execute()

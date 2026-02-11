@@ -215,7 +215,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 1. Booking Flow (Needs Name Only)
     booking_keywords = ["book", "reserve", "reservation", "slot"]
     if any(k in text_lower for k in booking_keywords):
-        # Strict Check: Name required
         if not await check_and_ask_context(update, context, required_fields=["name"]): return
         await handle_booking(update, text, rest_id)
         return
@@ -223,54 +222,47 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 2. Ordering Flow (Needs Name AND Table)
     ordering_keywords = ["order", "have", "eat", "cancel"]
     if any(k in text_lower for k in ordering_keywords):
-        # Strict Check: Name + Table required
         if not await check_and_ask_context(update, context, required_fields=["name", "table"]): return
         
-        # Pass Table Number and Chat ID to the Order Service
         reply = await process_order(text, update.effective_user, rest_id, session.get('table_number'), update.message.chat_id)
         await update.message.reply_text(reply)
         return
 
-    # 3. Service Requests
-    if any(k in text_lower for k in ["call waiter", "waiter", "bill", "check please"]):
+    # 3. Service Requests & BILLING (Updated Logic)
+    service_keywords = ["call waiter", "waiter", "bill", "check please", "payment", "pay"]
+    if any(k in text_lower for k in service_keywords):
+        # We definitely need the table number to calculate the bill
         if not await check_and_ask_context(update, context, required_fields=["table"]): return
         
-        req_type = "bill" if "bill" in text_lower or "check" in text_lower else "waiter"
+        table_num = session.get('table_number')
+        
+        # Check if it is a Bill Request or just calling a waiter
+        is_bill_request = "bill" in text_lower or "check" in text_lower or "pay" in text_lower
+        
+        if is_bill_request:
+            # Calculate Total from DB (Sum of unpaid orders for this table)
+            orders = supabase.table("orders").select("price")\
+                .eq("restaurant_id", rest_id)\
+                .eq("table_number", table_num)\
+                .neq("status", "paid")\
+                .execute()
+            
+            total_bill = sum(float(o['price']) for o in orders.data) if orders.data else 0.0
+            
+            await update.message.reply_text(f"🧾 **Bill Request Received**\n\nTable: {table_num}\nTotal Due: **${total_bill:.2f}**\n\nA waiter is coming with the payment machine.")
+            req_type = "BILL REQUEST"
+        else:
+            await update.message.reply_text("🔔 **Staff Notified!**\nA waiter will be with you shortly.")
+            req_type = "WAITER CALL"
+
+        # Notify Admin Panel
         supabase.table("service_requests").insert({
             "restaurant_id": rest_id,
-            "table_number": session.get('table_number'),
+            "table_number": table_num,
             "request_type": req_type,
             "status": "pending"
         }).execute()
-        await update.message.reply_text("🔔 Staff notified!")
         return
 
     # 4. Chat Flow (Fallback)
     await handle_chat(update, text, rest_id, details)
-
-# --- 6. SETUP SERVER ---
-request = HTTPXRequest(connection_pool_size=10, read_timeout=30.0, connect_timeout=30.0)
-ptb_app = Application.builder().token(TELEGRAM_TOKEN).request(request).build()
-
-ptb_app.add_handler(CommandHandler("start", start))
-ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-app = FastAPI()
-
-@app.post("/webhook")
-async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
-    data = await request.json()
-    async def process():
-        await ptb_app.initialize()
-        await ptb_app.process_update(Update.de_json(data, ptb_app.bot))
-    background_tasks.add_task(process)
-    return {"status": "ok"}
-
-@app.get("/")
-async def root():
-    return {"status": "Online", "model": "Groq Llama 3"}
-
-@app.on_event("startup")
-async def on_startup():
-    await ptb_app.initialize()
-    await ptb_app.start()
