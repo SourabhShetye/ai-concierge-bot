@@ -150,25 +150,38 @@ async def check_and_ask_context(update: Update, context: ContextTypes.DEFAULT_TY
         
     return True
 
+# 1. REPLACE THE START FUNCTION
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     args = context.args
+    
+    # Handle "No QR Code"
     if not args:
-        await update.message.reply_text("👋 Please scan a restaurant QR code.")
+        await update.message.reply_text("👋 Welcome! Please scan a restaurant QR code to begin.")
         return
     
     rest_id = args[0]
-    res = supabase.table("restaurants").select("*").eq("id", rest_id).execute()
     
+    # Verify Restaurant
+    res = supabase.table("restaurants").select("*").eq("id", rest_id).execute()
     if not res.data:
         await update.message.reply_text("❌ Restaurant not found.")
         return
-        
-    # Create Session
-    supabase.table("user_sessions").upsert({"user_id": user_id, "current_restaurant_id": rest_id}).execute()
     
     details = res.data[0]
-    await update.message.reply_text(f"👋 Welcome to {details['name']}! How can I help?")
+    
+    # ✅ CRITICAL FIX: Reset Table Number on new scan
+    # We keep 'customer_name' (people don't change names), but wipe 'table_number'.
+    session_data = {
+        "user_id": str(user_id),
+        "current_restaurant_id": str(rest_id),
+        "table_number": None # <--- THIS FORCES THE BOT TO ASK AGAIN
+    }
+    
+    # Upsert: Updates the existing row or creates a new one
+    supabase.table("user_sessions").upsert(session_data).execute()
+    
+    await update.message.reply_text(f"👋 Welcome to **{details['name']}**!\n\nI've reset your session. When you are ready to order, I will ask for your new table number.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -191,6 +204,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # B. ROUTING
     text_lower = text.lower()
+    
+    # --- NEW: MANUAL RESET COMMAND ---
+    if text_lower in ["reset", "change table", "wrong table", "new table", "start over"]:
+        # Wipe table number manually
+        supabase.table("user_sessions").update({"table_number": None}).eq("user_id", user_id).execute()
+        # Clean up context
+        if 'awaiting_info' in context.user_data: del context.user_data['awaiting_info']
+        
+        await update.message.reply_text("🔄 **Table Reset!**\n\nI have forgotten your table number. When you order next, I will ask for it again.")
+        return
     
     # 1. Booking Flow
     if any(k in text_lower for k in ["book", "reserve", "reservation"]):
