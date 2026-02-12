@@ -70,7 +70,7 @@ async def handle_booking(update: Update, user_text: str, rest_id: str):
 
         booking_time = f"{data['date']} {data['time']}"
 
-        # 3. CHECK AVAILABILITY (Using the SQL function we created)
+        # 3. CHECK AVAILABILITY
         # We manually check count instead of calling the function to avoid RPC complexity issues
         slot_count = supabase.table("bookings").select("*", count="exact")\
             .eq("restaurant_id", rest_id)\
@@ -141,7 +141,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # FALLBACK: If no ID provided, check if we have a default one or ask user to scan
     rest_id = args[0] if args else "default_rest_id" 
     
-    # Verify ID exists, if "default_rest_id", maybe fetch the first one from DB
+    # Verify ID exists, if "default_rest_id", fetch the first one from DB
     if rest_id == "default_rest_id":
         first_rest = supabase.table("restaurants").select("id").limit(1).execute()
         if first_rest.data:
@@ -222,10 +222,23 @@ ptb_app.add_handler(CommandHandler("start", start))
 ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
 app = FastAPI()
+
+# ✅ FIXED: Define the wrapper properly
+async def process_telegram_update(data):
+    await ptb_app.process_update(Update.de_json(data, ptb_app.bot))
+
 @app.post("/webhook")
 async def webhook(request: Request, bg: BackgroundTasks):
     data = await request.json()
-    bg.add_task(lambda: ptb_app.process_update(Update.de_json(data, ptb_app.bot)))
+    # ✅ FIXED: Pass the function and argument separately
+    bg.add_task(process_telegram_update, data)
     return {"status": "ok"}
+
+@app.get("/")
+async def root():
+    return {"status": "Bot is running!"}
+
 @app.on_event("startup")
-async def startup(): await ptb_app.initialize(); await ptb_app.start()
+async def startup():
+    await ptb_app.initialize()
+    await ptb_app.start()
