@@ -40,69 +40,86 @@ async def handle_booking(update: Update, user_text: str, rest_id: str):
     user = update.effective_user
     today = datetime.now().strftime("%Y-%m-%d")
     
-    # --- FIX: USE DATE RANGE INSTEAD OF TEXT MATCH ---
-    # We check if booking_time is between 00:00 and 23:59 today
-    start_of_day = f"{today} 00:00:00"
-    end_of_day = f"{today} 23:59:59"
+    # 1. AI Extraction
+    prompt = f"""
+    Extract booking details from this text: "{user_text}"
+    Current Date: {today}
+    
+    Rules:
+    - If date is missing, set "valid": false.
+    - If time is missing, set "valid": false.
+    - If guests missing, default to 2.
+    
+    Return ONLY this JSON format:
+    {{
+      "valid": true,
+      "date": "YYYY-MM-DD",
+      "time": "HH:MM",
+      "guests": 2
+    }}
+    """
+    
+    # Call AI
+    response_text, error = await call_groq(prompt, "You are a JSON extractor machine. Output ONLY JSON.")
+    
+    if error or not response_text:
+        print(f"AI Error: {error}")
+        await update.message.reply_text("📉 System busy. Please try again.")
+        return
 
+    # 2. ROBUST JSON PARSING (The Fix)
     try:
-        existing = supabase.table("bookings").select("*")\
-            .eq("user_id", str(user.id))\
-            .gte("booking_time", start_of_day)\
-            .lte("booking_time", end_of_day)\
-            .execute()
-            
-        if existing.data:
-            # Parse the time cleanly for display
-            booked_time = existing.data[0]['booking_time'].split('T')[1][:5]
-            await update.message.reply_text(f"⚠️ You already have a reservation for today at {booked_time}.")
-            return
+        # Debug: See exactly what the AI sent
+        print(f"DEBUG AI RESPONSE: {response_text}")
 
-        # 2. Extract Details (AI)
-        prompt = f"""
-        Extract booking: "{user_text}"
-        Today: {today}
-        Return JSON: {{"valid": true, "date": "YYYY-MM-DD", "time": "HH:MM", "guests": 2}}
-        """
-        response, error = await call_groq(prompt, "JSON Extractor")
+        # Find the start and end of the JSON object
+        start_idx = response_text.find("{")
+        end_idx = response_text.rfind("}")
         
-        if error or not response:
-            await update.message.reply_text("📉 System busy. Try again.")
-            return
-
-        data = json.loads(response.replace("```json", "").replace("```", "").strip())
+        if start_idx == -1 or end_idx == -1:
+            raise ValueError("No JSON object found in response")
+            
+        # Slice only the valid JSON part
+        clean_json = response_text[start_idx : end_idx + 1]
+        data = json.loads(clean_json)
+        
+        # 3. Validation
         if not data.get("valid"):
-            await update.message.reply_text("Please specify Date, Time, and Number of Guests.")
+            await update.message.reply_text("Please specify the Date, Time, and Number of People for your reservation.")
             return
 
         booking_time = f"{data['date']} {data['time']}"
 
-        # 3. CHECK AVAILABILITY (Fix: Use date string for comparison)
-        # We fetch all bookings for this specific time slot to count them
-        slot_bookings = supabase.table("bookings").select("id")\
+        # 4. Check Availability (10 table limit)
+        # Using string comparison for dates which works reliably in Supabase
+        slot_bookings = supabase.table("bookings").select("*", count="exact")\
             .eq("restaurant_id", rest_id)\
             .eq("booking_time", booking_time)\
             .execute()
             
-        if len(slot_bookings.data) >= 10:
-            await update.message.reply_text(f"❌ Sorry, {data['time']} is fully booked. Please try a different time.")
+        if slot_bookings.count >= 10:
+            await update.message.reply_text(f"❌ Sorry, {data['time']} is fully booked. Please choose a different time.")
             return
 
-        # 4. Insert Booking
+        # 5. Save to Database
         booking = {
             "restaurant_id": str(rest_id),
             "user_id": str(user.id),
-            "customer_name": user.full_name,
+            "customer_name": user.full_name or "Guest",
             "party_size": int(data['guests']),
             "booking_time": booking_time,
             "status": "confirmed"
         }
-        supabase.table("bookings").insert(booking).execute()
-        await update.message.reply_text(f"✅ **Confirmed!**\n📅 {data['date']} @ {data['time']}\n👤 {data['guests']} Guests")
         
+        supabase.table("bookings").insert(booking).execute()
+        await update.message.reply_text(f"✅ **Booking Confirmed!**\n📅 {data['date']} at {data['time']}\n👤 {data['guests']} Guests")
+        
+    except json.JSONDecodeError:
+        print(f"JSON Parse Error. AI Output was: {response_text}")
+        await update.message.reply_text("⚠️ I understood you, but had a glitch processing the date. Please try saying it simpler, like: 'Book table for 2 tomorrow at 8pm'")
     except Exception as e:
-        print(f"Booking Error: {e}")
-        await update.message.reply_text("❌ Error processing booking. Please try again.")
+        print(f"Database/Logic Error: {e}")
+        await update.message.reply_text("❌ System Error. Please try again.")
 
 # --- FEATURE 2: MENU CHAT ---
 async def handle_chat(update: Update, user_text: str, rest_id: str):
