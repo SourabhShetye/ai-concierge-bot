@@ -38,31 +38,38 @@ async def call_groq(prompt, system_role="You are a helpful assistant."):
 # --- FEATURE 1: ROBUST BOOKING (Prevents Double Booking) ---
 async def handle_booking(update: Update, user_text: str, rest_id: str):
     user = update.effective_user
-    
-    # 1. Check if user ALREADY has a booking today (Prevent Spam)
     today = datetime.now().strftime("%Y-%m-%d")
-    existing = supabase.table("bookings").select("*")\
-        .eq("user_id", str(user.id))\
-        .ilike("booking_time", f"{today}%")\
-        .execute()
-        
-    if existing.data:
-        await update.message.reply_text(f"⚠️ You already have a reservation for today at {existing.data[0]['booking_time'].split(' ')[1]}.")
-        return
-
-    # 2. Extract Details
-    prompt = f"""
-    Extract booking: "{user_text}"
-    Today: {today}
-    Return JSON: {{"valid": true, "date": "YYYY-MM-DD", "time": "HH:MM", "guests": 2}}
-    """
-    response, error = await call_groq(prompt, "JSON Extractor")
     
-    if error or not response:
-        await update.message.reply_text("📉 System busy. Try again.")
-        return
+    # --- FIX: USE DATE RANGE INSTEAD OF TEXT MATCH ---
+    # We check if booking_time is between 00:00 and 23:59 today
+    start_of_day = f"{today} 00:00:00"
+    end_of_day = f"{today} 23:59:59"
 
     try:
+        existing = supabase.table("bookings").select("*")\
+            .eq("user_id", str(user.id))\
+            .gte("booking_time", start_of_day)\
+            .lte("booking_time", end_of_day)\
+            .execute()
+            
+        if existing.data:
+            # Parse the time cleanly for display
+            booked_time = existing.data[0]['booking_time'].split('T')[1][:5]
+            await update.message.reply_text(f"⚠️ You already have a reservation for today at {booked_time}.")
+            return
+
+        # 2. Extract Details (AI)
+        prompt = f"""
+        Extract booking: "{user_text}"
+        Today: {today}
+        Return JSON: {{"valid": true, "date": "YYYY-MM-DD", "time": "HH:MM", "guests": 2}}
+        """
+        response, error = await call_groq(prompt, "JSON Extractor")
+        
+        if error or not response:
+            await update.message.reply_text("📉 System busy. Try again.")
+            return
+
         data = json.loads(response.replace("```json", "").replace("```", "").strip())
         if not data.get("valid"):
             await update.message.reply_text("Please specify Date, Time, and Number of Guests.")
@@ -70,14 +77,14 @@ async def handle_booking(update: Update, user_text: str, rest_id: str):
 
         booking_time = f"{data['date']} {data['time']}"
 
-        # 3. CHECK AVAILABILITY
-        # We manually check count instead of calling the function to avoid RPC complexity issues
-        slot_count = supabase.table("bookings").select("*", count="exact")\
+        # 3. CHECK AVAILABILITY (Fix: Use date string for comparison)
+        # We fetch all bookings for this specific time slot to count them
+        slot_bookings = supabase.table("bookings").select("id")\
             .eq("restaurant_id", rest_id)\
             .eq("booking_time", booking_time)\
-            .execute().count
+            .execute()
             
-        if slot_count >= 10:
+        if len(slot_bookings.data) >= 10:
             await update.message.reply_text(f"❌ Sorry, {data['time']} is fully booked. Please try a different time.")
             return
 
@@ -95,7 +102,7 @@ async def handle_booking(update: Update, user_text: str, rest_id: str):
         
     except Exception as e:
         print(f"Booking Error: {e}")
-        await update.message.reply_text("❌ Error processing booking.")
+        await update.message.reply_text("❌ Error processing booking. Please try again.")
 
 # --- FEATURE 2: MENU CHAT ---
 async def handle_chat(update: Update, user_text: str, rest_id: str):
