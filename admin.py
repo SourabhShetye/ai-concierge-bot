@@ -30,11 +30,29 @@ st.caption(f"Restaurant ID: {current_rest_id}") # DEBUG ID
 
 tab1, tab2, tab3 = st.tabs(["📅 Bookings", "👨‍🍳 Kitchen", "💰 Live Tables"])
 
+# --- TAB 1: BOOKINGS ---
 with tab1:
-    if st.button("Refresh Bookings"): st.rerun()
-    data = supabase.table("bookings").select("*").eq("restaurant_id", current_rest_id).order("booking_time", desc=True).execute().data
-    if data: st.dataframe(pd.DataFrame(data)[['customer_name', 'booking_time', 'party_size']])
-    else: st.info("No bookings.")
+        st.subheader("Upcoming Reservations")
+        if st.button("🔄 Refresh Bookings"):
+            st.rerun()
+            
+        try:
+            res = supabase.table("bookings").select("*").eq("restaurant_id", current_rest_id).order("booking_time", desc=True).execute()
+            if res.data:
+                df = pd.DataFrame(res.data)
+                
+                # --- TIMEZONE FIX ---
+                # Convert string to datetime
+                df['booking_time'] = pd.to_datetime(df['booking_time'])
+                # Add 4 hours for Dubai display (Adjust logic if needed)
+                df['booking_time'] = df['booking_time'] + pd.Timedelta(hours=4)
+                
+                display_cols = ['customer_name', 'booking_time', 'party_size', 'status']
+                st.dataframe(df[display_cols], use_container_width=True)
+            else:
+                st.info("No bookings found yet.")
+        except Exception as e:
+            st.error(f"Could not load bookings: {e}")
 
 with tab2:
     st_autorefresh(interval=5000, key="kds")
