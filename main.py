@@ -227,12 +227,46 @@ ptb_app = Application.builder().token(TELEGRAM_TOKEN).request(request).build()
 ptb_app.add_handler(CommandHandler("start", start))
 ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
+# ... (Keep all imports and logic above app = FastAPI()) ...
+
 app = FastAPI()
+
+# ✅ 1. Define a proper async task wrapper
+async def process_telegram_update(data: dict):
+    """
+    Async wrapper to process the update safely in the background.
+    """
+    try:
+        # Re-construct the Update object
+        update_obj = Update.de_json(data, ptb_app.bot)
+        
+        # Ensure the app is ready (idempotent)
+        if not ptb_app._initialized:
+            await ptb_app.initialize()
+            
+        # Process the update
+        await ptb_app.process_update(update_obj)
+        
+    except Exception as e:
+        print(f"❌ Update Processing Error: {e}")
+
+# ✅ 2. Webhook now passes the async function DIRECTLY
 @app.post("/webhook")
 async def webhook(request: Request, bg: BackgroundTasks):
     data = await request.json()
-    bg.add_task(lambda: asyncio.create_task(ptb_app.process_update(Update.de_json(data, ptb_app.bot))))
+    
+    # Do NOT use lambda or create_task here. Just pass the function.
+    bg.add_task(process_telegram_update, data)
+    
     return {"status": "ok"}
 
+@app.get("/")
+async def root():
+    return {"status": "Online"}
+
 @app.on_event("startup")
-async def startup(): await ptb_app.initialize(); await ptb_app.start()
+async def startup():
+    # Initialize the bot once on server start
+    await ptb_app.initialize()
+    await ptb_app.start()
+    print("🤖 Bot started successfully!")
