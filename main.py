@@ -297,5 +297,8 @@ async def webhook_listener(request: Request):
         
     return {"status": "ok"}
 
-@app.get("/")
-async def root(): return {"status": "System Online"}
+# --- HEALTH CHECK (Root) ---
+# Change from @app.get("/") to this:
+@app.api_route("/", methods=["GET", "HEAD"])
+async def root():
+    return {"status": "System Online"}
