@@ -264,18 +264,37 @@ else:
 @app.on_event("startup")
 async def startup():
     if TELEGRAM_TOKEN:
-        await ptb_app.initialize()
-        await ptb_app.start()
-        print("🤖 Bot Started")
+        # Initialize the bot app once on startup
+        if not ptb_app._initialized:
+            await ptb_app.initialize()
+            await ptb_app.start()
+        print("🤖 Bot Started & Ready")
 
+# --- WEBHOOK HANDLERS ---
+
+# 1. Add this to stop 405 errors from browsers/monitors
+@app.get("/webhook")
+async def webhook_check():
+    return {"status": "Webhook is online. Send POST requests for updates."}
+
+# 2. Rename the POST function slightly to be distinct
 @app.post("/webhook")
-async def webhook(request: Request):
+async def webhook_listener(request: Request):
     try:
         data = await request.json()
+        
+        # Ensure the bot is initialized
+        if not ptb_app._initialized:
+            await ptb_app.initialize()
+            await ptb_app.start()
+
+        # Process the update
         update = Update.de_json(data, ptb_app.bot)
         await ptb_app.process_update(update)
     except Exception as e:
         print(f"Webhook error: {e}")
+        return {"status": "error", "msg": str(e)}
+        
     return {"status": "ok"}
 
 @app.get("/")
