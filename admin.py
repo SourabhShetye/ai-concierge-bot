@@ -1,166 +1,535 @@
+"""
+Restaurant Admin Dashboard - Streamlit
+Production-Ready with Auto-Refresh, KDS, and Live Billing
+"""
+
 import streamlit as st
 import pandas as pd
 import requests
 import os
+from datetime import datetime
 from streamlit_autorefresh import st_autorefresh
 from dotenv import load_dotenv
 from supabase import create_client
 
-st.set_page_config(page_title="Concierge Admin", layout="wide", page_icon="👨‍🍳")
+# ============================================================================
+# PAGE CONFIGURATION
+# ============================================================================
+
+st.set_page_config(
+    page_title="Restaurant Admin Dashboard",
+    layout="wide",
+    page_icon="👨‍🍳",
+    initial_sidebar_state="expanded"
+)
+
+# Global auto-refresh: 5 seconds
+refresh_count = st_autorefresh(interval=5000, key="global_dashboard_refresh")
+
 load_dotenv()
 
-# Initialize Supabase
-url = os.getenv("SUPABASE_URL")
-key = os.getenv("SUPABASE_KEY")
-if not url or not key:
-    st.error("❌ Supabase credentials missing in .env")
+# ============================================================================
+# DATABASE CONNECTION
+# ============================================================================
+
+try:
+    supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
+except Exception as e:
+    st.error(f"❌ Database Connection Error: {e}")
     st.stop()
 
-supabase = create_client(url, key)
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
 
-# --- HELPER ---
-def send_telegram_msg(chat_id, text):
+def send_telegram_message(chat_id: str, text: str) -> bool:
+    """
+    Send a message to a Telegram user.
+    Returns True if successful, False otherwise.
+    """
     token = os.getenv("TELEGRAM_BOT_TOKEN")
-    if token and chat_id:
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        try:
-            requests.post(url, json={"chat_id": chat_id, "text": text})
-        except Exception as e:
-            print(f"Telegram Error: {e}")
+    
+    if not token or not chat_id:
+        return False
+    
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    
+    try:
+        response = requests.post(
+            url,
+            json={"chat_id": chat_id, "text": text},
+            timeout=5
+        )
+        return response.status_code == 200
+    except Exception as e:
+        print(f"[TELEGRAM ERROR] {e}")
+        return False
 
-# --- SIDEBAR ---
-st.sidebar.title("📍 Manager")
+
+def format_currency(amount: float) -> str:
+    """Format number as currency"""
+    return f"${amount:.2f}"
+
+
+def get_timestamp() -> str:
+    """Get current timestamp for logging"""
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+# ============================================================================
+# SIDEBAR - RESTAURANT SELECTION
+# ============================================================================
+
+st.sidebar.title("🏢 Restaurant Manager")
+
 try:
-    rests = supabase.table("restaurants").select("id, name").execute().data
-    if not rests:
-        st.sidebar.warning("No restaurants found in DB.")
-        options = {}
-        current_rest_id = None
-    else:
-        options = {r['name']: r['id'] for r in rests}
-        selected = st.sidebar.selectbox("Select Location", list(options.keys()))
-        current_rest_id = options[selected]
+    # Fetch all restaurants
+    restaurants_response = supabase.table("restaurants")\
+        .select("id, name")\
+        .execute()
+    
+    if not restaurants_response.data:
+        st.error("❌ No restaurants found in database")
+        st.stop()
+    
+    # Create selection dropdown
+    restaurant_options = {r["name"]: r["id"] for r in restaurants_response.data}
+    
+    selected_restaurant_name = st.sidebar.selectbox(
+        "Select Location",
+        list(restaurant_options.keys()),
+        key="restaurant_selector"
+    )
+    
+    current_restaurant_id = restaurant_options[selected_restaurant_name]
+    
+    # Display selection info
+    st.sidebar.success(f"📍 {selected_restaurant_name}")
+    st.sidebar.info(f"🔄 Last refresh: {get_timestamp()}")
+    
 except Exception as e:
-    st.sidebar.error(f"DB Error: {e}")
-    current_rest_id = None
+    st.error(f"❌ Error loading restaurants: {e}")
+    st.stop()
 
-# --- MAIN ---
-if current_rest_id:
-    st.title(f"Dashboard: {selected}")
-    tab1, tab2, tab3 = st.tabs(["📅 Bookings", "👨‍🍳 Kitchen", "💰 Live Tables"])
+# ============================================================================
+# MAIN DASHBOARD HEADER
+# ============================================================================
 
-    # --- TAB 1: BOOKINGS ---
-    with tab1:
-        st.subheader("Upcoming Reservations")
-        if st.button("🔄 Refresh Bookings"):
+st.title(f"📊 Dashboard: {selected_restaurant_name}")
+st.markdown("---")
+
+# Create tabs
+tab1, tab2, tab3 = st.tabs([
+    "📅 Bookings Management",
+    "👨‍🍳 Kitchen Display System",
+    "💰 Live Tables & Billing"
+])
+
+# ============================================================================
+# TAB 1: BOOKINGS MANAGEMENT
+# ============================================================================
+
+with tab1:
+    st.header("📅 Reservations & Bookings")
+    
+    # Action buttons row
+    col_action1, col_action2, col_action3, col_action4 = st.columns(4)
+    
+    with col_action1:
+        if st.button("🔄 Refresh Data", use_container_width=True):
             st.rerun()
-            
-        try:
-            res = supabase.table("bookings").select("*").eq("restaurant_id", current_rest_id).order("booking_time", desc=True).execute()
-            if res.data:
-                df = pd.DataFrame(res.data)
+    
+    with col_action2:
+        if st.button("🗑️ Purge Cancelled", use_container_width=True, type="secondary"):
+            try:
+                delete_result = supabase.table("bookings")\
+                    .delete()\
+                    .eq("status", "cancelled")\
+                    .eq("restaurant_id", current_restaurant_id)\
+                    .execute()
                 
-                # --- TIMEZONE FIX ---
-                df['booking_time'] = pd.to_datetime(df['booking_time'])
-                # Adjust for display only (assuming UTC in DB, +4 for Dubai)
-                df['display_time'] = df['booking_time'] + pd.Timedelta(hours=4)
-                
-                # Reorder columns
-                df = df[['customer_name', 'display_time', 'party_size', 'status']]
-                df.columns = ['Name', 'Time (Dubai)', 'Guests', 'Status']
-                
-                st.dataframe(df, use_container_width=True)
-            else:
-                st.info("No bookings found.")
-        except Exception as e:
-            st.error(f"Could not load bookings: {e}")
-
-    # --- TAB 2: KITCHEN ---
-    with tab2:
-        st_autorefresh(interval=10000, key="kds") # Refresh every 10s
-        st.header("🔥 Live Kitchen")
+                st.toast("✅ Cancelled bookings permanently deleted", icon="🗑️")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Error deleting bookings: {e}")
+    
+    st.markdown("---")
+    
+    # Fetch bookings
+    try:
+        bookings_response = supabase.table("bookings")\
+            .select("*")\
+            .eq("restaurant_id", current_restaurant_id)\
+            .order("booking_time", desc=False)\
+            .execute()
         
-        # Fetch ALL pending orders for this restaurant
-        # We filter in Python to avoid Supabase NULL/Empty string filter issues
-        try:
-            raw_orders = supabase.table("orders").select("*").eq("restaurant_id", current_rest_id).eq("status", "pending").execute().data
+        bookings = bookings_response.data
+        
+        if bookings:
+            # Statistics
+            total_bookings = len(bookings)
+            confirmed = len([b for b in bookings if b["status"] == "confirmed"])
+            cancelled = len([b for b in bookings if b["status"] == "cancelled"])
             
-            # Split into Cancellations and New Orders
-            cancellations = [o for o in raw_orders if o.get('cancellation_status') == 'requested']
-            active_orders = [o for o in raw_orders if o.get('cancellation_status') != 'requested']
+            stat_col1, stat_col2, stat_col3 = st.columns(3)
+            stat_col1.metric("Total Bookings", total_bookings)
+            stat_col2.metric("Confirmed", confirmed, delta=None)
+            stat_col3.metric("Cancelled", cancelled, delta=None)
+            
+            st.markdown("---")
+            
+            # Bulk action form
+            with st.form("bulk_booking_actions"):
+                st.subheader("📋 Booking List")
+                st.caption("Select bookings to cancel in bulk")
+                
+                selected_booking_ids = []
+                
+                # Create table-like display
+                for booking in bookings:
+                    col1, col2, col3, col4, col5 = st.columns([0.5, 2, 1.5, 1.5, 1])
+                    
+                    # Checkbox
+                    is_selected = col1.checkbox(
+                        "Select",
+                        key=f"booking_check_{booking['id']}",
+                        label_visibility="collapsed"
+                    )
+                    
+                    if is_selected:
+                        selected_booking_ids.append(booking["id"])
+                    
+                    # Customer name
+                    col2.write(f"**{booking['customer_name']}**")
+                    
+                    # Party size
+                    col3.write(f"👥 {booking['party_size']} guests")
+                    
+                    # Booking time
+                    try:
+                        booking_dt = datetime.fromisoformat(booking['booking_time'].replace('Z', '+00:00'))
+                        time_str = booking_dt.strftime("%b %d, %I:%M %p")
+                    except:
+                        time_str = booking['booking_time']
+                    
+                    col4.write(f"📅 {time_str}")
+                    
+                    # Status badge
+                    status = booking['status']
+                    if status == "confirmed":
+                        col5.success("✅ Confirmed")
+                    elif status == "cancelled":
+                        col5.error("❌ Cancelled")
+                    else:
+                        col5.info(f"ℹ️ {status}")
+                    
+                    st.divider()
+                
+                # Bulk action buttons
+                submit_col1, submit_col2 = st.columns(2)
+                
+                with submit_col1:
+                    if st.form_submit_button("❌ Cancel Selected Bookings", type="primary", use_container_width=True):
+                        if selected_booking_ids:
+                            try:
+                                for booking_id in selected_booking_ids:
+                                    supabase.table("bookings")\
+                                        .update({"status": "cancelled"})\
+                                        .eq("id", booking_id)\
+                                        .execute()
+                                
+                                st.success(f"✅ Cancelled {len(selected_booking_ids)} booking(s)")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Error cancelling bookings: {e}")
+                        else:
+                            st.warning("⚠️ No bookings selected")
+        
+        else:
+            st.info("📭 No bookings found for this location")
+    
+    except Exception as e:
+        st.error(f"❌ Error loading bookings: {e}")
 
-            # 1. CANCELLATIONS
-            if cancellations:
-                st.error("🚨 CANCELLATION REQUESTS")
-                for c in cancellations:
-                    with st.container(border=True):
-                        col1, col2 = st.columns([3, 1])
-                        col1.write(f"**Table {c.get('table_number')}** wants to cancel:\n{c.get('items')}")
-                        if col2.button("Approve Cancel", key=f"app_{c['id']}"):
-                            supabase.table("orders").update({"status": "cancelled", "cancellation_status": "approved"}).eq("id", c['id']).execute()
-                            send_telegram_msg(c.get('chat_id'), "✅ Cancellation Approved.")
-                            st.rerun()
+# ============================================================================
+# TAB 2: KITCHEN DISPLAY SYSTEM (KDS)
+# ============================================================================
 
-            # 2. ACTIVE ORDERS
-            if active_orders:
-                st.subheader("New Orders")
-                for o in active_orders:
-                    with st.container(border=True):
-                        c1, c2 = st.columns([3, 1])
-                        c1.markdown(f"### Table {o.get('table_number')}")
-                        c1.markdown(f"**{o.get('items')}**")
-                        c1.caption(f"Customer: {o.get('customer_name')}")
+with tab2:
+    st.header("🔥 Kitchen Display System")
+    
+    # KDS-specific auto-refresh (faster)
+    st_autorefresh(interval=3000, key="kds_refresh")
+    
+    # Fetch pending orders
+    try:
+        orders_response = supabase.table("orders")\
+            .select("*")\
+            .eq("restaurant_id", current_restaurant_id)\
+            .eq("status", "pending")\
+            .order("created_at", desc=False)\
+            .execute()
+        
+        orders = orders_response.data
+        
+        if orders:
+            st.info(f"📋 {len(orders)} order(s) in queue")
+            st.markdown("---")
+            
+            for idx, order in enumerate(orders):
+                # Container for each order
+                with st.container(border=True):
+                    # Header row
+                    header_col1, header_col2, header_col3 = st.columns([2, 1, 1])
+                    
+                    header_col1.markdown(f"### 🪑 Table {order['table_number']}")
+                    header_col2.markdown(f"**{order['customer_name']}**")
+                    
+                    # Calculate time since order
+                    try:
+                        created_at = datetime.fromisoformat(order['created_at'].replace('Z', '+00:00'))
+                        time_ago = datetime.now() - created_at.replace(tzinfo=None)
+                        minutes_ago = int(time_ago.total_seconds() / 60)
+                        header_col3.caption(f"⏱️ {minutes_ago} min ago")
+                    except:
+                        header_col3.caption("⏱️ Just now")
+                    
+                    # Order items
+                    st.markdown(f"**Order #{order['id']}**")
+                    st.write(f"🍽️ {order['items']}")
+                    st.write(f"💰 {format_currency(order['price'])}")
+                    
+                    st.markdown("---")
+                    
+                    # Check cancellation status
+                    cancellation_status = order.get('cancellation_status', 'none')
+                    
+                    if cancellation_status == 'requested':
+                        # Cancellation request pending
+                        st.warning("⚠️ **CANCELLATION REQUESTED BY CUSTOMER**")
                         
-                        if c2.button("✅ Ready", key=f"rdy_{o['id']}"):
-                            supabase.table("orders").update({"status": "completed"}).eq("id", o['id']).execute()
-                            send_telegram_msg(o.get('chat_id'), f"🍽️ Order Ready! (Table {o.get('table_number')})")
-                            st.rerun()
-            elif not cancellations:
-                st.info("Kitchen is clear. No pending orders.")
-
-            # 3. WAITER BELLS
-            reqs = supabase.table("service_requests").select("*").eq("restaurant_id", current_rest_id).eq("status", "pending").execute().data
-            if reqs:
-                st.warning("🔔 SERVICE REQUESTS")
-                for r in reqs:
-                    if st.button(f"Resolve {r['request_type']} (Table {r['table_number']})", key=f"srv_{r['id']}"):
-                        supabase.table("service_requests").update({"status": "completed"}).eq("id", r['id']).execute()
-                        st.rerun()
-
-        except Exception as e:
-            st.error(f"Error fetching orders: {e}")
-
-    # --- TAB 3: LIVE TABLES ---
-    with tab3:
-        if st.button("Refresh Tables"): st.rerun()
+                        action_col1, action_col2 = st.columns(2)
+                        
+                        with action_col1:
+                            if st.button(
+                                "✅ Approve Cancellation",
+                                key=f"approve_cancel_{order['id']}",
+                                use_container_width=True,
+                                type="primary"
+                            ):
+                                try:
+                                    # Update order status
+                                    supabase.table("orders")\
+                                        .update({
+                                            "status": "cancelled",
+                                            "cancellation_status": "approved"
+                                        })\
+                                        .eq("id", order["id"])\
+                                        .execute()
+                                    
+                                    # Notify customer
+                                    if order.get('chat_id'):
+                                        send_telegram_message(
+                                            order['chat_id'],
+                                            "✅ Your cancellation request has been approved."
+                                        )
+                                    
+                                    st.success("Cancellation approved")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Error: {e}")
+                        
+                        with action_col2:
+                            if st.button(
+                                "❌ Reject Cancellation",
+                                key=f"reject_cancel_{order['id']}",
+                                use_container_width=True
+                            ):
+                                try:
+                                    # Update cancellation status
+                                    supabase.table("orders")\
+                                        .update({"cancellation_status": "rejected"})\
+                                        .eq("id", order["id"])\
+                                        .execute()
+                                    
+                                    # Notify customer
+                                    if order.get('chat_id'):
+                                        send_telegram_message(
+                                            order['chat_id'],
+                                            "❌ Cancellation rejected. Kitchen is preparing your food."
+                                        )
+                                    
+                                    st.success("Cancellation rejected")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Error: {e}")
+                    
+                    else:
+                        # Normal order - show "Ready" button
+                        if st.button(
+                            "✅ Mark as Ready",
+                            key=f"ready_{order['id']}",
+                            use_container_width=True,
+                            type="primary"
+                        ):
+                            try:
+                                # Update order status
+                                supabase.table("orders")\
+                                    .update({"status": "completed"})\
+                                    .eq("id", order["id"])\
+                                    .execute()
+                                
+                                # Notify customer
+                                if order.get('chat_id'):
+                                    send_telegram_message(
+                                        order['chat_id'],
+                                        f"🍽️ Your order is ready! (Table {order['table_number']})"
+                                    )
+                                
+                                st.success(f"✅ Order #{order['id']} marked as ready")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Error: {e}")
         
-        try:
-            # Fetch active (unpaid) orders
-            active = supabase.table("orders").select("*").eq("restaurant_id", current_rest_id).neq("status", "paid").neq("status", "cancelled").execute().data
+        else:
+            st.success("🎉 Kitchen Clear - No pending orders!")
+    
+    except Exception as e:
+        st.error(f"❌ Error loading orders: {e}")
+
+# ============================================================================
+# TAB 3: LIVE TABLES & BILLING
+# ============================================================================
+
+with tab3:
+    st.header("💰 Live Tables & Billing")
+    
+    # Refresh button
+    if st.button("🔄 Refresh Tables", use_container_width=False):
+        st.rerun()
+    
+    st.markdown("---")
+    
+    # Fetch active orders (not paid, not cancelled)
+    try:
+        active_orders_response = supabase.table("orders")\
+            .select("*")\
+            .eq("restaurant_id", current_restaurant_id)\
+            .neq("status", "paid")\
+            .neq("status", "cancelled")\
+            .execute()
+        
+        active_orders = active_orders_response.data
+        
+        if active_orders:
+            # Group orders by table number
+            tables_data = {}
             
-            tables = {}
-            for o in active:
-                tn = o.get('table_number', 'Unknown')
-                if tn not in tables: 
-                    tables[tn] = {"total": 0, "items": [], "chat_id": o.get('chat_id')}
+            for order in active_orders:
+                table_num = order['table_number']
                 
-                tables[tn]["total"] += float(o.get('price', 0))
-                tables[tn]["items"].append(f"{o.get('items')} (${o.get('price')})")
+                if table_num not in tables_data:
+                    tables_data[table_num] = {
+                        "total": 0.0,
+                        "items": [],
+                        "dish_names": set(),
+                        "chat_id": order.get("chat_id"),
+                        "order_ids": []
+                    }
                 
-            if tables:
-                for tn, data in tables.items():
-                    with st.container(border=True):
-                        c1, c2 = st.columns([3,1])
-                        c1.subheader(f"Table {tn} - Total: ${data['total']:.2f}")
-                        c1.text("\n".join(data['items']))
-                        if c2.button(f"💰 Close & Pay", key=f"cls_{tn}"):
-                            # Mark all orders for this table as paid
-                            supabase.table("orders").update({"status": "paid"}).eq("table_number", tn).eq("restaurant_id", current_rest_id).neq("status", "cancelled").execute()
-                            send_telegram_msg(data['chat_id'], "✅ Payment Received. Thank you for visiting!")
+                # Add to totals
+                tables_data[table_num]["total"] += float(order['price'])
+                tables_data[table_num]["items"].append(
+                    f"{order['items']} ({format_currency(order['price'])})"
+                )
+                tables_data[table_num]["order_ids"].append(order['id'])
+                
+                # Extract dish names for feedback
+                for item in order['items'].split(','):
+                    # Remove price info in parentheses
+                    clean_name = item.split('(')[0].strip()
+                    if clean_name:
+                        tables_data[table_num]["dish_names"].add(clean_name)
+            
+            # Display statistics
+            st.info(f"🪑 {len(tables_data)} active table(s)")
+            st.markdown("---")
+            
+            # Display each table
+            for table_number, data in sorted(tables_data.items()):
+                with st.container(border=True):
+                    # Table header
+                    table_col1, table_col2 = st.columns([3, 1])
+                    
+                    table_col1.markdown(f"### 🪑 Table {table_number}")
+                    table_col2.markdown(f"### {format_currency(data['total'])}")
+                    
+                    st.markdown("---")
+                    
+                    # Order items
+                    st.markdown("**Orders:**")
+                    for item in data['items']:
+                        st.write(f"• {item}")
+                    
+                    st.markdown("---")
+                    
+                    # Payment button
+                    if st.button(
+                        "💳 Close Table & Request Payment",
+                        key=f"pay_table_{table_number}",
+                        use_container_width=True,
+                        type="primary"
+                    ):
+                        try:
+                            # Update all orders for this table to "paid"
+                            for order_id in data['order_ids']:
+                                supabase.table("orders")\
+                                    .update({"status": "paid"})\
+                                    .eq("id", order_id)\
+                                    .execute()
+                            
+                            # Construct feedback request message
+                            dishes_list = "\n".join([f"• {dish}" for dish in sorted(data['dish_names'])])
+                            
+                            feedback_message = (
+                                f"✅ **Payment Received - Thank You!**\n\n"
+                                f"💰 Total: {format_currency(data['total'])}\n\n"
+                                f"We hope you enjoyed your meal! 😊\n\n"
+                                f"⭐ **Please rate your experience:**\n\n"
+                                f"**Dishes:**\n{dishes_list}\n\n"
+                                f"Reply with ratings (1-5 stars) for each dish "
+                                f"and your overall restaurant experience.\n\n"
+                                f"Example: 5, 4, 5 (Overall: 5)"
+                            )
+                            
+                            # Send feedback request to customer
+                            if data['chat_id']:
+                                telegram_success = send_telegram_message(
+                                    data['chat_id'],
+                                    feedback_message
+                                )
+                                
+                                if telegram_success:
+                                    st.success(f"✅ Table {table_number} closed & feedback request sent!")
+                                else:
+                                    st.warning(f"✅ Table {table_number} closed (feedback not sent)")
+                            else:
+                                st.success(f"✅ Table {table_number} closed")
+                            
                             st.rerun()
-            else:
-                st.info("No active tables.")
-        except Exception as e:
-            st.error(f"Error loading tables: {e}")
-else:
-    st.warning("Please select a restaurant or check database connection.")
+                            
+                        except Exception as e:
+                            st.error(f"Error closing table: {e}")
+        
+        else:
+            st.info("📭 No active tables at the moment")
+    
+    except Exception as e:
+        st.error(f"❌ Error loading tables: {e}")
+
+# ============================================================================
+# FOOTER
+# ============================================================================
+
+st.markdown("---")
+st.caption(f"🔄 Auto-refresh enabled • Last updated: {get_timestamp()}")
