@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from supabase import create_client
 from groq import AsyncGroq
 from dotenv import load_dotenv
@@ -88,7 +89,13 @@ async def process_order(user_text, user, rest_id, table_number, chat_id):
             temperature=0, max_tokens=200
         )
         
-        data = json.loads(completion.choices[0].message.content.replace("```json", "").replace("```", "").strip())
+        content = completion.choices[0].message.content
+        match = re.search(r"\{.*\}", content, re.DOTALL)
+        
+        if not match:
+            return "❌ Error: AI response was not valid JSON."
+            
+        data = json.loads(match.group(0))
         
         if not data.get("valid"): return "❌ I didn't find those items. Tip: Say 'I want the Burger'."
 

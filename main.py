@@ -96,14 +96,34 @@ async def finalize_booking(update, context, date, time, guests, rest_id):
     
     booking_time = f"{date} {time}:00"
 
-    # Check for existing bookings to prevent double booking
-    slot_bookings = supabase.table("bookings").select("*", count="exact")\
-        .eq("restaurant_id", rest_id)\
-        .eq("booking_time", booking_time)\
-        .neq("status", "cancelled")\
-        .execute()
+    try:
+        # Create timezone-aware times for accurate comparison
+        now_dubai = get_dubai_time()
+        req_time = datetime.strptime(booking_time_str, "%Y-%m-%d %H:%M:%S")
+        # Force the requested time to have the same timezone (+4)
+        req_time = req_time.replace(tzinfo=timezone(timedelta(hours=4)))
         
-    if slot_bookings.count >= 10:
+        if req_time < now_dubai:
+            await update.message.reply_text("❌ You cannot book a slot in the past. Please choose a future time.")
+            return
+    except Exception as e:
+        print(f"Time Check Error: {e}") # Log it but don't crash
+
+    # --- NEW: DUPLICATE CHECK ---
+    existing = supabase.table("bookings").select("*")\
+        .eq("restaurant_id", rest_id)\
+        .eq("booking_time", booking_time_str)\
+        .eq("status", "confirmed")\
+        .execute()
+    
+    # Check if THIS user already booked this slot
+    for b in existing.data:
+        if b['user_id'] == str(user.id):
+            await update.message.reply_text(f"⚠️ You already have a booking for {time}!")
+            return
+
+    # Check Capacity (Limit 10)
+    if existing.count >= 10:
         await update.message.reply_text(f"❌ {time} is fully booked. Please try another time.")
         return
 

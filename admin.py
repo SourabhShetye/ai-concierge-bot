@@ -7,6 +7,10 @@ from dotenv import load_dotenv
 from supabase import create_client
 
 st.set_page_config(page_title="Concierge Admin", layout="wide", page_icon="👨‍🍳")
+
+# Refresh the entire dashboard every 5000ms (5 seconds)
+st_autorefresh(interval=5000, key="global_refresh")
+
 load_dotenv()
 
 supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
@@ -39,6 +43,11 @@ tab1, tab2, tab3 = st.tabs(["📅 Bookings", "👨‍🍳 Kitchen", "💰 Live T
 # --- TAB 1: BOOKINGS (Fixed: Bulk Actions) ---
 with tab1:
     col_a, col_b = st.columns([1, 4])
+    # --- NEW: PURGE BUTTON ---
+    if col_a.button("🗑️ Purge Cancelled"):
+        supabase.table("bookings").delete().eq("status", "cancelled").eq("restaurant_id", current_rest_id).execute()
+        st.toast("Cancelled bookings permanently deleted.")
+        st.rerun()
     if col_a.button("🔄 Refresh"): st.rerun()
     
     # Fetch Data
