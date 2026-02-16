@@ -97,38 +97,41 @@ async def finalize_booking(update, context, date, time, guests, rest_id):
     
     booking_time_str = f"{date} {time}:00"
 
-    # 1. STRICT TIME CHECK
+    # 1. TIME CHECK
     try:
         now_dubai = get_dubai_time()
-        # Create naive datetime from string
         req_time = datetime.strptime(booking_time_str, "%Y-%m-%d %H:%M:%S")
-        # Force timezone awareness to match Dubai (+4)
         req_time = req_time.replace(tzinfo=timezone(timedelta(hours=4)))
         
         if req_time < now_dubai:
-            await update.message.reply_text(f"❌ **Cannot book in the past.**\nCurrent time: {now_dubai.strftime('%Y-%m-%d %H:%M')}\nYou asked for: {date} {time}")
+            await update.message.reply_text(f"❌ **Cannot book in the past.**\nCurrent time: {now_dubai.strftime('%Y-%m-%d %H:%M')}")
             return
     except Exception as e:
         print(f"Time Check Error: {e}")
 
-    # 2. CHECK EXISTING
-    existing = supabase.table("bookings").select("*")\
+    # 2. CHECK EXISTING & CAPACITY (FIXED)
+    # Added count='exact' so existing.count is not None
+    existing = supabase.table("bookings").select("*", count="exact")\
         .eq("restaurant_id", rest_id)\
         .eq("booking_time", booking_time_str)\
         .eq("status", "confirmed")\
         .execute()
     
-    for b in existing.data:
-        if b['user_id'] == str(user.id):
-             await update.message.reply_text(f"⚠️ You already have a booking for {time}!")
-             return
+    # Check for duplicates for THIS user
+    if existing.data:
+        for b in existing.data:
+            if b['user_id'] == str(user.id):
+                 await update.message.reply_text(f"⚠️ You already have a booking for {time}!")
+                 return
 
-    # 3. CAPACITY
-    if existing.count >= 10:
+    # Check Capacity (Safety: use 'or 0' to handle potential None)
+    current_count = existing.count if existing.count is not None else len(existing.data)
+    
+    if current_count >= 10:
         await update.message.reply_text(f"❌ {time} is fully booked. Please try another time.")
         return
 
-    # INSERT
+    # 3. INSERT
     booking = {
         "restaurant_id": str(rest_id),
         "user_id": str(user.id),
