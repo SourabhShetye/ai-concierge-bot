@@ -144,6 +144,22 @@ async def calculate_bill(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(f"🧾 **Current Bill:**\n\n{items_list}\n\n💰 **Total To Pay: ${total}**\n\n(Ask for a waiter to pay)")
 
+async def handle_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Simple handler to catch ratings so they don't trigger the Order AI"""
+    text = update.message.text.lower()
+    
+    # Simple heuristics for feedback detection
+    is_rating = False
+    if len(text) < 5 and any(char.isdigit() for char in text): # e.g. "5", "4.5"
+        is_rating = True
+    elif "star" in text or "/5" in text or "rate" in text:
+        is_rating = True
+        
+    if is_rating:
+        await update.message.reply_text("⭐ **Thank you for your feedback!** We look forward to serving you again.")
+        return True
+    return False
+
 # --- MAIN ROUTER ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -155,6 +171,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text_lower in ["cancel", "stop", "reset"]:
         context.user_data.clear()
         await update.message.reply_text("🔄 Action cancelled. How can I help?")
+        return
+
+    # --- NEW: CHECK FEEDBACK FIRST ---
+    if await handle_feedback(update, context):
         return
 
     # 1. STATE: AWAITING NAME
