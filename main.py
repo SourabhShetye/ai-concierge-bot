@@ -94,51 +94,52 @@ async def finalize_booking(update, context, date, time, guests, rest_id):
     session = get_user_session(user.id)
     customer_name = session.get('customer_name', 'Guest')
     
-    booking_time = f"{date} {time}:00"
+    booking_time_str = f"{date} {time}:00"
 
+    # 1. STRICT TIME CHECK
     try:
-        # Create timezone-aware times for accurate comparison
         now_dubai = get_dubai_time()
+        # Create naive datetime from string
         req_time = datetime.strptime(booking_time_str, "%Y-%m-%d %H:%M:%S")
-        # Force the requested time to have the same timezone (+4)
+        # Force timezone awareness to match Dubai (+4)
         req_time = req_time.replace(tzinfo=timezone(timedelta(hours=4)))
         
         if req_time < now_dubai:
-            await update.message.reply_text("❌ You cannot book a slot in the past. Please choose a future time.")
+            await update.message.reply_text(f"❌ **Cannot book in the past.**\nCurrent time: {now_dubai.strftime('%Y-%m-%d %H:%M')}\nYou asked for: {date} {time}")
             return
     except Exception as e:
-        print(f"Time Check Error: {e}") # Log it but don't crash
+        print(f"Time Check Error: {e}")
 
-    # --- NEW: DUPLICATE CHECK ---
+    # 2. CHECK EXISTING
     existing = supabase.table("bookings").select("*")\
         .eq("restaurant_id", rest_id)\
         .eq("booking_time", booking_time_str)\
         .eq("status", "confirmed")\
         .execute()
     
-    # Check if THIS user already booked this slot
     for b in existing.data:
         if b['user_id'] == str(user.id):
-            await update.message.reply_text(f"⚠️ You already have a booking for {time}!")
-            return
+             await update.message.reply_text(f"⚠️ You already have a booking for {time}!")
+             return
 
-    # Check Capacity (Limit 10)
+    # 3. CAPACITY
     if existing.count >= 10:
         await update.message.reply_text(f"❌ {time} is fully booked. Please try another time.")
         return
 
+    # INSERT
     booking = {
         "restaurant_id": str(rest_id),
         "user_id": str(user.id),
         "customer_name": customer_name,
         "party_size": int(guests),
-        "booking_time": booking_time,
+        "booking_time": booking_time_str,
         "status": "confirmed"
     }
     supabase.table("bookings").insert(booking).execute()
     context.user_data.clear()
     await update.message.reply_text(f"✅ **Booking Confirmed!**\n👤 {customer_name}\n📅 {date} at {time}\n👥 {guests} Guests")
-
+    
 # --- BILLING LOGIC (FIXED) ---
 async def calculate_bill(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -193,10 +194,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🔄 Action cancelled. How can I help?")
         return
 
-    # --- NEW: CHECK FEEDBACK FIRST ---
-    if await handle_feedback(update, context):
-        return
-
     # 1. STATE: AWAITING NAME
     if state == 'AWAITING_NAME':
         forbidden = ["book", "order", "food", "table", "menu"]
@@ -236,6 +233,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 3.5 STATE: AWAITING BOOKING DETAILS (Recovery)
     if state == 'AWAITING_BOOKING_DETAILS':
         await process_booking_request(update, context)
+        return
+    
+    # Now it only checks for ratings if we AREN'T waiting for guests/tables.
+    if await handle_feedback(update, context):
         return
 
     # --- INTENTS ---
