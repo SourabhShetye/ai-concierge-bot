@@ -22,9 +22,11 @@ def get_dubai_time():
 
 def get_user_session(user_id):
     try:
+        # Force string conversion to ensure match
         res = supabase.table("user_sessions").select("*").eq("user_id", str(user_id)).execute()
         return res.data[0] if res.data else None
-    except:
+    except Exception as e:
+        print(f"DB Error: {e}")
         return None
 
 # --- AI WRAPPER ---
@@ -44,14 +46,18 @@ async def process_booking_request(update: Update, context: ContextTypes.DEFAULT_
     user_text = update.message.text
     user_id = update.effective_user.id
     
-    # 1. Check Session/Name first
+    # 1. VALIDATE SESSION & NAME
     session = get_user_session(user_id)
-    if not session or not session.get('customer_name'):
+    if not session:
+        await update.message.reply_text("⚠️ Connection lost. Please type /start to reconnect.")
+        return
+
+    if not session.get('customer_name'):
         context.user_data['state'] = 'AWAITING_NAME'
         await update.message.reply_text("👋 Before we book, **what is your name?**")
         return
 
-    # 2. Extract Details
+    # 2. EXTRACT DETAILS
     now_dubai = get_dubai_time()
     prompt = f"""
     Extract booking details from: "{user_text}"
@@ -74,7 +80,6 @@ async def process_booking_request(update: Update, context: ContextTypes.DEFAULT_
         data = json.loads(clean_json)
         
         if not data.get("valid"):
-            # If invalid, ask specifically and SET STATE so we capture the answer
             context.user_data['state'] = 'AWAITING_BOOKING_DETAILS'
             await update.message.reply_text("🤔 I didn't catch the date or time. Please say it clearly (e.g., 'Tomorrow at 7pm').")
             return
@@ -89,13 +94,13 @@ async def process_booking_request(update: Update, context: ContextTypes.DEFAULT_
         
     except Exception as e:
         print(f"Booking Parse Error: {e}")
-        context.user_data['state'] = 'AWAITING_BOOKING_DETAILS' # Stay in loop
+        context.user_data['state'] = 'AWAITING_BOOKING_DETAILS'
         await update.message.reply_text("❌ I didn't understand that. Please try 'Book for 2 people tomorrow at 8pm'.")
 
 async def finalize_booking(update, context, date, time, guests, rest_id):
     user = update.effective_user
     session = get_user_session(user.id)
-    customer_name = session.get('customer_name')
+    customer_name = session.get('customer_name', 'Guest')
     
     booking_time = f"{date} {time}:00"
 
@@ -122,7 +127,6 @@ async def finalize_booking(update, context, date, time, guests, rest_id):
     context.user_data.clear()
     await update.message.reply_text(f"✅ **Booking Confirmed!**\n👤 {customer_name}\n📅 {date} at {time}\n👥 {guests} Guests")
 
-
 # --- MAIN HANDLER ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -136,11 +140,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🔄 Action cancelled. How can I help?")
         return
 
-    # 1. STATE: AWAITING NAME
+    # 1. STATE: AWAITING NAME (Bug Fix Applied Here)
     if state == 'AWAITING_NAME':
-        supabase.table("user_sessions").update({"customer_name": text}).eq("user_id", str(user_id)).execute()
-        context.user_data['state'] = None
-        await update.message.reply_text(f"Nice to meet you, {text}! \n\nWhat would you like to do?\n🔹 **Book a table**\n🔹 **Order food**")
+        # GUARD: Don't accept commands as names
+        forbidden_names = ["book", "order", "food", "table", "menu", "hi", "hello"]
+        if any(w in text_lower for w in forbidden_names) and len(text.split()) < 3:
+            await update.message.reply_text("⚠️ That sounds like a command. Please enter your **Name** to continue (e.g., 'John').")
+            return
+
+        # FORCE UPDATE
+        try:
+            supabase.table("user_sessions").update({"customer_name": text}).eq("user_id", str(user_id)).execute()
+            context.user_data['state'] = None
+            await update.message.reply_text(f"Nice to meet you, {text}! \n\nWhat would you like to do?\n🔹 **Book a table**\n🔹 **Order food**")
+        except Exception as e:
+            await update.message.reply_text("❌ Error saving name. Please try again.")
+            print(f"Name Save Error: {e}")
         return
 
     # 2. STATE: AWAITING GUESTS
@@ -155,9 +170,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("🔢 Please enter a number (e.g. '4').")
             return
 
-    # 3. STATE: AWAITING BOOKING DETAILS (Fix for the loop issue)
+    # 3. STATE: AWAITING BOOKING DETAILS
     if state == 'AWAITING_BOOKING_DETAILS':
-        # Send text back to the extractor
         await process_booking_request(update, context)
         return
 
@@ -170,26 +184,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- INTENT DETECTION ---
 
-    # A. MENU QUERY (CRITICAL FIX: Check this BEFORE Order)
-    # If user asks for menu, we show it. We DO NOT order.
+    # A. MENU
     if "menu" in text_lower and "order" not in text_lower:
         session = get_user_session(user_id)
         if session:
             menu_res = supabase.table("menu_items").select("content").eq("restaurant_id", session['current_restaurant_id']).limit(40).execute()
             if menu_res.data:
-                # Just show the raw items nicely formatted
                 items = "\n".join([f"• {m['content'].splitlines()[1].replace('item: ', '')}" for m in menu_res.data if 'item:' in m['content']])
-                await update.message.reply_text(f"📜 **Here is our Menu:**\n\n{items}\n\nTo order, say 'I want the [Item Name]'.")
+                await update.message.reply_text(f"📜 **Menu:**\n\n{items}\n\nSay 'I want the [Item]' to order.")
             else:
-                await update.message.reply_text("🚫 No menu found for this location.")
+                await update.message.reply_text("🚫 No menu found.")
         return
 
-    # B. BOOKING INTENT
+    # B. BOOKING
     if any(k in text_lower for k in ["book", "reserve", "reservation"]):
         await process_booking_request(update, context)
         return
 
-    # C. ORDER INTENT
+    # C. ORDER
     if any(k in text_lower for k in ["order", "have", "eat", "drink", "want"]):
         session = get_user_session(user_id)
         if not session:
@@ -201,12 +213,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("🍽️ **What is your Table Number?**")
             return
             
-        # Process Order
         reply = await process_order(text, update.effective_user, session['current_restaurant_id'], session['table_number'], update.message.chat_id)
         await update.message.reply_text(reply)
         return
 
-    # D. FALLBACK (General Chat)
+    # D. FALLBACK
     session = get_user_session(user_id)
     if session:
         menu_res = supabase.table("menu_items").select("content").eq("restaurant_id", session['current_restaurant_id']).limit(10).execute()
@@ -214,54 +225,66 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply, _ = await call_groq(f"Menu: {menu}\nUser: {text}", "Restaurant Concierge. Be brief.")
         if reply: await update.message.reply_text(reply)
 
-# --- COMMANDS ---
-
+# --- STARTUP COMMAND ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     args = context.args
-    rest_id = args[0] if args else "1" # Default to 1 if no link used
-
-    # UPSERT SESSION (Force update rest_id)
-    data = {
-        "user_id": str(user_id),
-        "current_restaurant_id": str(rest_id),
-        # We don't overwrite name here, so returning users are remembered.
-        # IF you want to force name ask every time, set "customer_name": None
-    }
     
-    # Check if new or existing
-    existing = get_user_session(user_id)
-    
-    if existing and existing.get('customer_name'):
-        # Update ONLY rest_id for existing user
-        supabase.table("user_sessions").update({"current_restaurant_id": str(rest_id)}).eq("user_id", str(user_id)).execute()
-        msg = f"👋 Welcome back, {existing['customer_name']}! (Restaurant ID: {rest_id})"
-        context.user_data['state'] = None
+    # 1. CLEAN PARSING of rest_id
+    # Handles: /start, /start 123, /start rest_id=123
+    raw_arg = args[0] if args else "1"
+    if "=" in raw_arg:
+        rest_id = raw_arg.split("=")[1]
     else:
-        # Create new session
-        data["customer_name"] = None 
-        data["table_number"] = None
-        supabase.table("user_sessions").upsert(data).execute()
-        msg = "👋 Welcome! I am your AI Concierge."
-        context.user_data['state'] = 'AWAITING_NAME'
+        rest_id = raw_arg
 
-    await update.message.reply_text(msg)
-    if context.user_data.get('state') == 'AWAITING_NAME':
-        await update.message.reply_text("To get started, **what is your name?**")
+    # 2. SESSION HANDLING
+    try:
+        existing = get_user_session(user_id)
+        
+        # Data payload
+        data = {
+            "user_id": str(user_id),
+            "current_restaurant_id": str(rest_id)
+        }
 
-# NEW: RESET COMMAND
+        # Logic: If name exists, keep it. If not, reset to trigger prompt.
+        if existing and existing.get('customer_name'):
+             # User returning: Just update restaurant ID
+             supabase.table("user_sessions").update(data).eq("user_id", str(user_id)).execute()
+             msg = f"👋 Welcome back, {existing['customer_name']}! (Location: {rest_id})"
+             context.user_data['state'] = None
+        else:
+            # New user: Create row, Name is NULL
+            data["customer_name"] = None 
+            data["table_number"] = None
+            supabase.table("user_sessions").upsert(data).execute()
+            msg = "👋 Welcome! I am your AI Concierge."
+            context.user_data['state'] = 'AWAITING_NAME'
+
+        await update.message.reply_text(msg)
+        if context.user_data.get('state') == 'AWAITING_NAME':
+            await update.message.reply_text("To get started, **what is your name?**")
+            
+    except Exception as e:
+        print(f"Start Error: {e}")
+        await update.message.reply_text("⚠️ System Error. Please try again.")
+
+# --- RESET COMMAND ---
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    # Delete session from DB
-    supabase.table("user_sessions").delete().eq("user_id", str(user_id)).execute()
-    context.user_data.clear()
-    await update.message.reply_text("🔄 **System Reset.**\nYou are now a new customer.\nType /start to begin.")
+    try:
+        supabase.table("user_sessions").delete().eq("user_id", str(user_id)).execute()
+        context.user_data.clear()
+        await update.message.reply_text("🔄 **System Reset.**\nYou are now a new customer.\nType /start to begin.")
+    except Exception as e:
+        await update.message.reply_text(f"Reset failed: {e}")
 
 # --- SERVER ---
 app = FastAPI()
 ptb_app = Application.builder().token(TELEGRAM_TOKEN).build()
 ptb_app.add_handler(CommandHandler("start", start))
-ptb_app.add_handler(CommandHandler("reset", reset)) # Add reset handler
+ptb_app.add_handler(CommandHandler("reset", reset))
 ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
 @app.post("/webhook")
