@@ -226,36 +226,70 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if reply: await update.message.reply_text(reply)
 
 # --- STARTUP COMMAND ---
+# --- STARTUP COMMAND (ROBUST VERSION) ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     args = context.args
     
-    # 1. CLEAN PARSING of rest_id
+    # 1. PARSE ARGUMENT
     # Handles: /start, /start 123, /start rest_id=123
-    raw_arg = args[0] if args else "1"
-    if "=" in raw_arg:
-        rest_id = raw_arg.split("=")[1]
-    else:
-        rest_id = raw_arg
+    target_rest_id = None
+    raw_arg = args[0] if args else None
+    
+    if raw_arg:
+        if "=" in raw_arg:
+            target_rest_id = raw_arg.split("=")[1]
+        else:
+            target_rest_id = raw_arg
 
-    # 2. SESSION HANDLING
+    # 2. VALIDATE/FETCH RESTAURANT ID
+    # We must ensure the ID actually exists in the DB, or the foreign key will fail.
+    final_rest_id = None
+    
+    try:
+        # If user provided an ID, check if it exists
+        if target_rest_id:
+            check = supabase.table("restaurants").select("id").eq("id", target_rest_id).execute()
+            if check.data:
+                final_rest_id = target_rest_id
+        
+        # Fallback: If no ID provided OR provided ID was invalid, get the first available one
+        if not final_rest_id:
+            fallback = supabase.table("restaurants").select("id").limit(1).execute()
+            if fallback.data:
+                final_rest_id = fallback.data[0]['id']
+            else:
+                await update.message.reply_text("⚠️ No restaurants found in database. Please add one via Supabase.")
+                return
+
+    except Exception as e:
+        # If ID format is wrong (e.g. text for int column), this catches it
+        print(f"ID Check Error: {e}")
+        # Try to get a valid one ignoring the user input
+        try:
+            fallback = supabase.table("restaurants").select("id").limit(1).execute()
+            if fallback.data:
+                final_rest_id = fallback.data[0]['id']
+        except:
+            await update.message.reply_text("❌ Database Connection Error.")
+            return
+
+    # 3. SESSION HANDLING
     try:
         existing = get_user_session(user_id)
         
-        # Data payload
         data = {
             "user_id": str(user_id),
-            "current_restaurant_id": str(rest_id)
+            "current_restaurant_id": str(final_rest_id)
         }
 
-        # Logic: If name exists, keep it. If not, reset to trigger prompt.
         if existing and existing.get('customer_name'):
-             # User returning: Just update restaurant ID
+             # Existing user: Update location, keep name
              supabase.table("user_sessions").update(data).eq("user_id", str(user_id)).execute()
-             msg = f"👋 Welcome back, {existing['customer_name']}! (Location: {rest_id})"
+             msg = f"👋 Welcome back, {existing['customer_name']}!"
              context.user_data['state'] = None
         else:
-            # New user: Create row, Name is NULL
+            # New user: Insert
             data["customer_name"] = None 
             data["table_number"] = None
             supabase.table("user_sessions").upsert(data).execute()
@@ -267,8 +301,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("To get started, **what is your name?**")
             
     except Exception as e:
-        print(f"Start Error: {e}")
-        await update.message.reply_text("⚠️ System Error. Please try again.")
+        print(f"Start Upsert Error: {e}")
+        await update.message.reply_text("⚠️ System Error: Could not create session. Check server logs.")
 
 # --- RESET COMMAND ---
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
