@@ -54,8 +54,9 @@ async def process_booking_request(update: Update, context: ContextTypes.DEFAULT_
     prompt = f"""
     Extract booking details from: "{user_text}"
     CONTEXT: Current Time (Dubai): {now_dubai.strftime('%Y-%m-%d %H:%M')}, Today is {now_dubai.strftime('%A')}
-    RULES:
-    1. Calculate YYYY-MM-DD from words like "tomorrow".
+    
+    CRITICAL RULES:
+    1. EXTRACT Date and Time. If the user DID NOT specify a time (e.g., just said "book for 3"), return "valid": false.
     2. Convert time to 24-hour HH:MM.
     3. If guests/party size is NOT mentioned, set "guests": null.
     
@@ -145,14 +146,13 @@ async def calculate_bill(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🧾 **Current Bill:**\n\n{items_list}\n\n💰 **Total To Pay: ${total}**\n\n(Ask for a waiter to pay)")
 
 async def handle_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Simple handler to catch ratings so they don't trigger the Order AI"""
-    text = update.message.text.lower()
+    text = update.message.text.lower().strip()
     
-    # Simple heuristics for feedback detection
+    # STRICTER RATING CHECK: Only 1-5 alone, or specific phrases
     is_rating = False
-    if len(text) < 5 and any(char.isdigit() for char in text): # e.g. "5", "4.5"
+    if text.isdigit() and 1 <= int(text) <= 5: # "5"
         is_rating = True
-    elif "star" in text or "/5" in text or "rate" in text:
+    elif any(x in text for x in ["/5", "star rating", "stars"]): # "5/5", "4 stars"
         is_rating = True
         
     if is_rating:
@@ -203,6 +203,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 3. STATE: AWAITING TABLE
     if state == 'AWAITING_TABLE':
+        # FIX: Ensure it is actually a number
+        if not text.isdigit():
+            await update.message.reply_text("⚠️ Invalid Table Number. Please enter digits only (e.g., '7' or '99').")
+            return
+
         supabase.table("user_sessions").update({"table_number": text}).eq("user_id", str(user_id)).execute()
         del context.user_data['state']
         await update.message.reply_text(f"✅ Table {text} set! You can now order food.")
