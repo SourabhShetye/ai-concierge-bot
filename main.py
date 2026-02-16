@@ -72,9 +72,10 @@ async def process_booking_request(update: Update, context: ContextTypes.DEFAULT_
         clean_json = response[response.find("{"):response.rfind("}")+1]
         data = json.loads(clean_json)
         
-        if not data.get("valid"):
+        # FIX: Strictly check that Date AND Time exist before proceeding
+        if not data.get("valid") or not data.get("date") or not data.get("time"):
             context.user_data['state'] = 'AWAITING_BOOKING_DETAILS'
-            await update.message.reply_text("🤔 I didn't catch the date or time. Please say it clearly (e.g., 'Tomorrow at 7pm').")
+            await update.message.reply_text("🤔 I didn't catch the exact date or time. Please say it clearly (e.g., 'Tomorrow at 7pm').")
             return
 
         if data.get('guests') is None:
@@ -194,111 +195,104 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🔄 Action cancelled. How can I help?")
         return
 
-    # 1. STATE: AWAITING NAME
+    # --- 1. STATE HANDLERS (Must Run First) ---
+    
     if state == 'AWAITING_NAME':
         forbidden = ["book", "order", "food", "table", "menu"]
         if any(w in text_lower for w in forbidden) and len(text.split()) < 3:
             await update.message.reply_text("⚠️ Please enter your **Name** first.")
             return
-
         supabase.table("user_sessions").update({"customer_name": text}).eq("user_id", str(user_id)).execute()
         context.user_data['state'] = None
         await update.message.reply_text(f"Nice to meet you, {text}! \n\nWhat would you like to do?\n🔹 **Book a table**\n🔹 **Order food**")
         return
 
-    # 2. STATE: AWAITING GUESTS
     if state == 'AWAITING_GUESTS':
+        # FIX: Better error handling to see REAL errors
         try:
-            guests = int(''.join(filter(str.isdigit, text)))
             partial = context.user_data.get('partial_booking')
+            if not partial: 
+                raise ValueError("Session Data Lost")
+
+            digits = ''.join(filter(str.isdigit, text))
+            if not digits:
+                await update.message.reply_text("🔢 Please enter a number (e.g. '4').")
+                return
+                
+            guests = int(digits)
             session = get_user_session(user_id)
             await finalize_booking(update, context, partial['date'], partial['time'], guests, session['current_restaurant_id'])
             return
-        except:
-            await update.message.reply_text("🔢 Please enter a number (e.g. '4').")
+        except ValueError as e:
+            if "Session" in str(e):
+                await update.message.reply_text("⚠️ Booking session expired. Please say 'Book a table' again.")
+                context.user_data.clear()
+            else:
+                await update.message.reply_text("⚠️ System Error. Please try booking again.")
+            return
+        except Exception as e:
+            print(f"Guest Error: {e}")
+            await update.message.reply_text("⚠️ Something went wrong. Please try again.")
             return
 
-    # 3. STATE: AWAITING TABLE
     if state == 'AWAITING_TABLE':
-        # FIX: Ensure it is actually a number
         if not text.isdigit():
-            await update.message.reply_text("⚠️ Invalid Table Number. Please enter digits only (e.g., '7' or '99').")
+            await update.message.reply_text("⚠️ Invalid Table Number. Please digits only (e.g., '7').")
             return
-
         supabase.table("user_sessions").update({"table_number": text}).eq("user_id", str(user_id)).execute()
         del context.user_data['state']
         await update.message.reply_text(f"✅ Table {text} set! You can now order food.")
         return
     
-    # 3.5 STATE: AWAITING BOOKING DETAILS (Recovery)
     if state == 'AWAITING_BOOKING_DETAILS':
         await process_booking_request(update, context)
         return
-    
-    # Now it only checks for ratings if we AREN'T waiting for guests/tables.
+
+    # --- 2. FEEDBACK CHECK (Runs AFTER States) ---
     if await handle_feedback(update, context):
         return
 
-    # --- INTENTS ---
-
-    # A. BILL
+    # --- 3. INTENTS ---
     if any(k in text_lower for k in ["bill", "check", "total", "pay"]) and "order" not in text_lower:
         await calculate_bill(update, context)
         return
 
-    # B. MENU (FIXED: Using AI Formatter)
     if "menu" in text_lower and "order" not in text_lower:
         session = get_user_session(user_id)
         if session:
             menu_res = supabase.table("menu_items").select("content").eq("restaurant_id", session['current_restaurant_id']).limit(40).execute()
             if menu_res.data:
-                # Use AI to format the menu nicely instead of brittle parsing
                 raw_text = "\n".join([m['content'] for m in menu_res.data])
-                formatted, _ = await call_groq(f"Format this restaurant data into a clean, readable menu list:\n{raw_text}", "Menu Formatter")
+                formatted, _ = await call_groq(f"Format this restaurant data into a clean menu list:\n{raw_text}", "Menu Formatter")
                 await update.message.reply_text(f"📜 **Menu:**\n\n{formatted}\n\nSay 'I want the [Item]' to order.")
             else:
                 await update.message.reply_text("🚫 No menu found for this location.")
         return
 
-    # C. BOOKING
     if any(k in text_lower for k in ["book", "reserve", "reservation"]):
         await process_booking_request(update, context)
         return
 
-    # D. ORDER
-    if any(k in text_lower for k in ["order", "have", "eat", "drink", "want"]):
+    if any(k in text_lower for k in ["order", "have", "eat", "drink", "want", "cancel", "remove"]):
         session = get_user_session(user_id)
         if not session:
             await update.message.reply_text("⚠️ Please type /start first.")
             return
-
         if not session.get('table_number'):
             context.user_data['state'] = 'AWAITING_TABLE'
             await update.message.reply_text("🍽️ **What is your Table Number?**")
             return
-            
         reply = await process_order(text, update.effective_user, session['current_restaurant_id'], session['table_number'], update.message.chat_id)
         await update.message.reply_text(reply)
         return
 
-    # E. FALLBACK (FIXED: Anti-Hallucination)
+    # Fallback
     session = get_user_session(user_id)
     if session:
         menu_res = supabase.table("menu_items").select("content").eq("restaurant_id", session['current_restaurant_id']).limit(10).execute()
         menu = "\n".join([m['content'] for m in menu_res.data]) if menu_res.data else ""
-        
-        # STRICT SYSTEM PROMPT
-        system_prompt = """
-        You are a Restaurant Concierge. 
-        CRITICAL RULES:
-        1. Do NOT confirm bookings yourself. If the user mentions a date/time, say: "Please explicitly say 'Book a table' to start the reservation process."
-        2. Do NOT take orders here. If the user mentions food, say: "Please say 'Order [item]'."
-        3. Be brief and helpful.
-        """
-        
-        reply, _ = await call_groq(f"Menu Context: {menu}\nUser: {text}", system_prompt)
+        reply, _ = await call_groq(f"Menu: {menu}\nUser: {text}", "Restaurant Concierge. Be brief.")
         if reply: await update.message.reply_text(reply)
-
 # --- STARTUP ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
