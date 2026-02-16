@@ -33,7 +33,7 @@ async def call_groq(prompt, system_role="You are a helpful assistant."):
         completion = await groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[{"role": "system", "content": system_role}, {"role": "user", "content": prompt}],
-            temperature=0, max_tokens=400
+            temperature=0, max_tokens=500
         )
         return completion.choices[0].message.content, None
     except Exception as e:
@@ -95,6 +95,7 @@ async def finalize_booking(update, context, date, time, guests, rest_id):
     
     booking_time = f"{date} {time}:00"
 
+    # Check for existing bookings to prevent double booking
     slot_bookings = supabase.table("bookings").select("*", count="exact")\
         .eq("restaurant_id", rest_id)\
         .eq("booking_time", booking_time)\
@@ -117,7 +118,7 @@ async def finalize_booking(update, context, date, time, guests, rest_id):
     context.user_data.clear()
     await update.message.reply_text(f"✅ **Booking Confirmed!**\n👤 {customer_name}\n📅 {date} at {time}\n👥 {guests} Guests")
 
-# --- BILLING LOGIC (NEW) ---
+# --- BILLING LOGIC (FIXED) ---
 async def calculate_bill(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     session = get_user_session(user_id)
@@ -126,9 +127,10 @@ async def calculate_bill(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ No active session.")
         return
 
-    # Fetch all unpaid, non-cancelled orders for this user
+    # FIX: Added .eq("restaurant_id", ...) to prevent cross-restaurant billing
     orders = supabase.table("orders").select("*")\
         .eq("user_id", str(user_id))\
+        .eq("restaurant_id", session['current_restaurant_id'])\
         .neq("status", "paid")\
         .neq("status", "cancelled")\
         .execute().data
@@ -185,31 +187,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         del context.user_data['state']
         await update.message.reply_text(f"✅ Table {text} set! You can now order food.")
         return
+    
+    # 3.5 STATE: AWAITING BOOKING DETAILS (Recovery)
+    if state == 'AWAITING_BOOKING_DETAILS':
+        await process_booking_request(update, context)
+        return
 
     # --- INTENTS ---
 
-    # A. BILL / CHECK (Priority High)
-    if any(k in text_lower for k in ["bill", "check", "total", "cost", "pay"]) and "order" not in text_lower:
+    # A. BILL
+    if any(k in text_lower for k in ["bill", "check", "total", "pay"]) and "order" not in text_lower:
         await calculate_bill(update, context)
         return
 
-    # B. MENU (Priority High)
+    # B. MENU (FIXED: Using AI Formatter)
     if "menu" in text_lower and "order" not in text_lower:
         session = get_user_session(user_id)
         if session:
             menu_res = supabase.table("menu_items").select("content").eq("restaurant_id", session['current_restaurant_id']).limit(40).execute()
             if menu_res.data:
-                # Robust parsing: Find the line starting with "item:"
-                clean_items = []
-                for m in menu_res.data:
-                    lines = m['content'].split('\n')
-                    for line in lines:
-                        if line.lower().startswith("item:"):
-                            clean_items.append(f"• {line.replace('item:', '').strip()}")
-                            break
-                
-                items_txt = "\n".join(clean_items) if clean_items else "Menu items format error."
-                await update.message.reply_text(f"📜 **Menu:**\n\n{items_txt}\n\nSay 'I want the [Item]' to order.")
+                # Use AI to format the menu nicely instead of brittle parsing
+                raw_text = "\n".join([m['content'] for m in menu_res.data])
+                formatted, _ = await call_groq(f"Format this restaurant data into a clean, readable menu list:\n{raw_text}", "Menu Formatter")
+                await update.message.reply_text(f"📜 **Menu:**\n\n{formatted}\n\nSay 'I want the [Item]' to order.")
             else:
                 await update.message.reply_text("🚫 No menu found for this location.")
         return
@@ -235,21 +235,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(reply)
         return
 
-    # E. FALLBACK
+    # E. FALLBACK (FIXED: Anti-Hallucination)
     session = get_user_session(user_id)
     if session:
-        # Pass a snippet of menu for context
         menu_res = supabase.table("menu_items").select("content").eq("restaurant_id", session['current_restaurant_id']).limit(10).execute()
         menu = "\n".join([m['content'] for m in menu_res.data]) if menu_res.data else ""
-        reply, _ = await call_groq(f"Menu: {menu}\nUser: {text}", "Restaurant Concierge. Be brief.")
+        
+        # STRICT SYSTEM PROMPT
+        system_prompt = """
+        You are a Restaurant Concierge. 
+        CRITICAL RULES:
+        1. Do NOT confirm bookings yourself. If the user mentions a date/time, say: "Please explicitly say 'Book a table' to start the reservation process."
+        2. Do NOT take orders here. If the user mentions food, say: "Please say 'Order [item]'."
+        3. Be brief and helpful.
+        """
+        
+        reply, _ = await call_groq(f"Menu Context: {menu}\nUser: {text}", system_prompt)
         if reply: await update.message.reply_text(reply)
 
-# --- STARTUP (SMART ID FIX) ---
+# --- STARTUP ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     args = context.args
     
-    # 1. PARSE INPUT
+    # Smart ID Logic
     target_id = None
     if args:
         raw = args[0]
@@ -257,24 +266,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else: target_id = raw
     
     final_id = None
-    
-    # 2. FIND RESTAURANT (Smart Match)
     if target_id:
-        # Try exact match, then 'rest_' prefix, then 'restaurant_' prefix
         candidates = [target_id, f"rest_{target_id}", f"restaurant_{target_id}"]
-        
         for cand in candidates:
             check = supabase.table("restaurants").select("id").eq("id", cand).execute()
             if check.data:
                 final_id = cand
                 break
     
-    # Fallback to first available if not found
     if not final_id:
         fallback = supabase.table("restaurants").select("id").limit(1).execute()
         final_id = fallback.data[0]['id'] if fallback.data else "error"
 
-    # 3. UPSERT SESSION
     try:
         existing = get_user_session(user_id)
         data = {"user_id": str(user_id), "current_restaurant_id": str(final_id)}
