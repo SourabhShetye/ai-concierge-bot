@@ -26,39 +26,71 @@ if current_rest_id:
     # TABS
     tab1, tab2, tab3 = st.tabs(["📅 Bookings", "👨‍🍳 Kitchen", "💰 Live Tables"])
 
-    # --- TAB 1: BOOKINGS (Fixed with Cancel Button) ---
-    with tab1:
-        st.subheader("Reservations Management")
-        if st.button("🔄 Refresh"): st.rerun()
-
-        # Fetch bookings
-        res = supabase.table("bookings").select("*").eq("restaurant_id", current_rest_id).order("booking_time", desc=True).execute()
+    # --- TAB 1: BOOKINGS (Interactive) ---
+with tab1:
+    st.subheader("Manage Reservations")
+    
+    # 1. Fetch Data
+    res = supabase.table("bookings").select("*").eq("restaurant_id", current_rest_id).order("booking_time", desc=True).execute()
+    
+    if res.data:
+        # Convert to Pandas DataFrame
+        df = pd.DataFrame(res.data)
         
-        if res.data:
-            for b in res.data:
-                # Color code based on status
-                status_color = "red" if b['status'] == 'cancelled' else "green"
-                
-                with st.container(border=True):
-                    c1, c2, c3, c4 = st.columns([2, 2, 1, 1])
-                    
-                    c1.markdown(f"**{b['customer_name']}** ({b['party_size']} ppl)")
-                    c1.caption(f"Status: :{status_color}[{b['status'].upper()}]")
-                    
-                    # Time formatting
-                    time_str = pd.to_datetime(b['booking_time']).strftime("%Y-%m-%d %H:%M")
-                    c2.write(f"📅 {time_str}")
+        # 2. Add 'Select' Checkbox Column (Default is False/Unchecked)
+        df.insert(0, "Select", False)
+        
+        # 3. Format Time for Display (Optional: Add +4 hours for Dubai)
+        df['booking_time'] = pd.to_datetime(df['booking_time'])
+        df['Display Time'] = df['booking_time'] + pd.Timedelta(hours=4)
+        
+        # 4. Interactive Editor
+        # We hide the 'id' and raw 'booking_time' but keep them in data for logic
+        edited_df = st.data_editor(
+            df,
+            column_config={
+                "Select": st.column_config.CheckboxColumn("✅", help="Select to delete", default=False),
+                "customer_name": "Customer Name",
+                "Display Time": "Date & Time",
+                "party_size": st.column_config.NumberColumn("Guests"),
+                "status": "Status",
+            },
+            disabled=["customer_name", "Display Time", "party_size", "status"], # Prevent editing text, only allow checkboxes
+            hide_index=True,
+            column_order=("Select", "customer_name", "Display Time", "party_size", "status"), # Hides ID column visually
+            key="booking_editor"
+        )
 
-                    # CANCEL BUTTON
-                    if b['status'] != 'cancelled':
-                        if c4.button("❌ Cancel", key=f"cnl_{b['id']}"):
-                            supabase.table("bookings").update({"status": "cancelled"}).eq("id", b['id']).execute()
-                            st.toast(f"Booking for {b['customer_name']} cancelled.")
-                            st.rerun()
-                    else:
-                        c4.write("🚫 Void")
-        else:
-            st.info("No bookings found.")
+        # 5. Action Buttons
+        col1, col2 = st.columns([1, 4])
+        
+        # BUTTON A: Delete Only Selected
+        if col1.button("🗑️ Delete Selected"):
+            # Filter rows where 'Select' is True
+            to_delete = edited_df[edited_df["Select"] == True]
+            
+            if not to_delete.empty:
+                # Get the IDs of selected rows
+                ids_to_remove = to_delete["id"].tolist()
+                
+                # Loop through and delete (Supabase doesn't always support bulk delete easily in client libs)
+                for booking_id in ids_to_remove:
+                    supabase.table("bookings").delete().eq("id", booking_id).execute()
+                
+                st.success(f"✅ Deleted {len(ids_to_remove)} bookings.")
+                st.rerun()
+            else:
+                st.warning("⚠️ No bookings selected.")
+
+        # BUTTON B: Clear All
+        if col2.button("⚠️ Clear ALL Bookings", type="primary"):
+            # Delete everything for this restaurant
+            supabase.table("bookings").delete().eq("restaurant_id", current_rest_id).execute()
+            st.toast("🔥 All bookings wiped!")
+            st.rerun()
+
+    else:
+        st.info("No bookings found.")
 
     # --- TAB 2: KITCHEN ---
     with tab2:
