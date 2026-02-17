@@ -114,7 +114,7 @@ def get_dubai_now() -> datetime:
     return datetime.now(DUBAI_TZ)
 
 
-def parse_booking_time(user_input: str) -> Optional[datetime]:
+async def parse_booking_time(user_input: str) -> Optional[datetime]:
     """
     Parse natural language time input into datetime.
     Returns None if invalid or in the past.
@@ -136,20 +136,14 @@ def parse_booking_time(user_input: str) -> Optional[datetime]:
         - If ambiguous, return valid: false
         """
         
-        # Synchronous call wrapped in async (for simplicity in this refactor)
-        # In production, consider making this fully async
-        import asyncio
-        loop = asyncio.get_event_loop()
+        # FIX: Directly await the async call
+        completion = await groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0
+        )
         
-        async def _parse():
-            completion = await groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0
-            )
-            return completion.choices[0].message.content
-        
-        response = loop.run_until_complete(_parse())
+        response = completion.choices[0].message.content
         
         # Extract JSON
         import json
@@ -179,7 +173,6 @@ def parse_booking_time(user_input: str) -> Optional[datetime]:
     except Exception as e:
         print(f"[TIME PARSE ERROR] {e}")
         return None
-
 
 def check_availability(restaurant_id: str, booking_time: datetime) -> bool:
     """
@@ -505,7 +498,7 @@ async def handle_booking_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
     # STATE: AWAITING_TIME
     elif user_state == UserState.AWAITING_TIME:
         # Parse booking time
-        booking_time = parse_booking_time(text)
+        booking_time = await parse_booking_time(text)
         
         if not booking_time:
             await update.message.reply_text(
@@ -781,7 +774,8 @@ async def telegram_webhook(request: Request):
         return {"status": "error", "message": str(e)}
 
 
-@app.get("/")
+# Change @app.get("/") to this:
+@app.api_route("/", methods=["GET", "HEAD"])
 async def health_check():
     """Health check endpoint"""
     return {
