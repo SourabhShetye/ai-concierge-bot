@@ -1,26 +1,9 @@
-# Copyright 2011 Yesudeep Mangalapilly <yesudeep@gmail.com>
-# Copyright 2012 Google, Inc & contributors.
-# Copyright 2014 Thomas Amland
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 from __future__ import annotations
 
 import os.path
 import platform
-import sys
 import threading
-import time
+from typing import TYPE_CHECKING
 
 from watchdog.events import (
     DirCreatedEvent,
@@ -35,44 +18,55 @@ from watchdog.events import (
     generate_sub_moved_events,
 )
 from watchdog.observers.api import DEFAULT_EMITTER_TIMEOUT, DEFAULT_OBSERVER_TIMEOUT, BaseObserver, EventEmitter
+from watchdog.observers.winapi import close_directory_handle, get_directory_handle, read_events
 
-assert sys.platform.startswith("win"), f"{__name__} requires Windows"
+if TYPE_CHECKING:
+    from ctypes.wintypes import HANDLE
 
-from watchdog.observers.winapi import close_directory_handle, get_directory_handle, read_events  # noqa: E402
-
-# HACK:
-WATCHDOG_TRAVERSE_MOVED_DIR_DELAY = 1  # seconds
+    from watchdog.events import FileSystemEvent
+    from watchdog.observers.api import EventQueue, ObservedWatch
+    from watchdog.observers.winapi import WinAPINativeEvent
 
 
 class WindowsApiEmitter(EventEmitter):
-    """
-    Windows API-based emitter that uses ReadDirectoryChangesW
+    """Windows API-based emitter that uses ReadDirectoryChangesW
     to detect file system changes for a watch.
     """
 
-    def __init__(self, event_queue, watch, timeout=DEFAULT_EMITTER_TIMEOUT):
-        super().__init__(event_queue, watch, timeout)
+    def __init__(
+        self,
+        event_queue: EventQueue,
+        watch: ObservedWatch,
+        *,
+        timeout: float = DEFAULT_EMITTER_TIMEOUT,
+        event_filter: list[type[FileSystemEvent]] | None = None,
+    ) -> None:
+        super().__init__(event_queue, watch, timeout=timeout, event_filter=event_filter)
         self._lock = threading.Lock()
-        self._handle = None
+        self._whandle: HANDLE | None = None
 
-    def on_thread_start(self):
-        self._handle = get_directory_handle(self.watch.path)
+    def on_thread_start(self) -> None:
+        self._whandle = get_directory_handle(self.watch.path)
 
     if platform.python_implementation() == "PyPy":
 
-        def start(self):
+        def start(self) -> None:
             """PyPy needs some time before receiving events, see #792."""
+            from time import sleep
+
             super().start()
-            time.sleep(0.01)
+            sleep(0.01)
 
-    def on_thread_stop(self):
-        if self._handle:
-            close_directory_handle(self._handle)
+    def on_thread_stop(self) -> None:
+        if self._whandle:
+            close_directory_handle(self._whandle)
 
-    def _read_events(self):
-        return read_events(self._handle, self.watch.path, self.watch.is_recursive)
+    def _read_events(self) -> list[WinAPINativeEvent]:
+        if not self._whandle:
+            return []
+        return read_events(self._whandle, self.watch.path, recursive=self.watch.is_recursive)
 
-    def queue_events(self, timeout):
+    def queue_events(self, timeout: float) -> None:
         winapi_events = self._read_events()
         with self._lock:
             last_renamed_src_path = ""
@@ -85,45 +79,19 @@ class WindowsApiEmitter(EventEmitter):
                     dest_path = src_path
                     src_path = last_renamed_src_path
                     if os.path.isdir(dest_path):
-                        event = DirMovedEvent(src_path, dest_path)
+                        self.queue_event(DirMovedEvent(src_path, dest_path))
                         if self.watch.is_recursive:
-                            # HACK: We introduce a forced delay before
-                            # traversing the moved directory. This will read
-                            # only file movement that finishes within this
-                            # delay time.
-                            time.sleep(WATCHDOG_TRAVERSE_MOVED_DIR_DELAY)
-                            # The following block of code may not
-                            # obtain moved events for the entire tree if
-                            # the I/O is not completed within the above
-                            # delay time. So, it's not guaranteed to work.
-                            # TODO: Come up with a better solution, possibly
-                            # a way to wait for I/O to complete before
-                            # queuing events.
-                            for sub_moved_event in generate_sub_moved_events(
-                                src_path, dest_path
-                            ):
+                            for sub_moved_event in generate_sub_moved_events(src_path, dest_path):
                                 self.queue_event(sub_moved_event)
-                        self.queue_event(event)
                     else:
                         self.queue_event(FileMovedEvent(src_path, dest_path))
                 elif winapi_event.is_modified:
-                    cls = (
-                        DirModifiedEvent
-                        if os.path.isdir(src_path)
-                        else FileModifiedEvent
-                    )
-                    self.queue_event(cls(src_path))
+                    self.queue_event((DirModifiedEvent if os.path.isdir(src_path) else FileModifiedEvent)(src_path))
                 elif winapi_event.is_added:
                     isdir = os.path.isdir(src_path)
-                    cls = DirCreatedEvent if isdir else FileCreatedEvent
-                    self.queue_event(cls(src_path))
+                    self.queue_event((DirCreatedEvent if isdir else FileCreatedEvent)(src_path))
                     if isdir and self.watch.is_recursive:
-                        # If a directory is moved from outside the watched folder to inside it
-                        # we only get a created directory event out of it, not any events for its children
-                        # so use the same hack as for file moves to get the child events
-                        time.sleep(WATCHDOG_TRAVERSE_MOVED_DIR_DELAY)
-                        sub_events = generate_sub_created_events(src_path)
-                        for sub_created_event in sub_events:
+                        for sub_created_event in generate_sub_created_events(src_path):
                             self.queue_event(sub_created_event)
                 elif winapi_event.is_removed:
                     self.queue_event(FileDeletedEvent(src_path))
@@ -133,10 +101,9 @@ class WindowsApiEmitter(EventEmitter):
 
 
 class WindowsApiObserver(BaseObserver):
-    """
-    Observer thread that schedules watching directories and dispatches
+    """Observer thread that schedules watching directories and dispatches
     calls to event handlers.
     """
 
-    def __init__(self, timeout=DEFAULT_OBSERVER_TIMEOUT):
-        super().__init__(emitter_class=WindowsApiEmitter, timeout=timeout)
+    def __init__(self, *, timeout: float = DEFAULT_OBSERVER_TIMEOUT) -> None:
+        super().__init__(WindowsApiEmitter, timeout=timeout)

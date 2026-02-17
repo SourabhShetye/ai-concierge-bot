@@ -1,4 +1,4 @@
-# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2024)
+# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,11 +14,13 @@
 
 import inspect
 import textwrap
+from collections.abc import Callable
+from typing import Any
 
 import streamlit as st
 
 
-def show_code(demo):
+def show_code(demo: Callable[..., Any]) -> None:
     """Showing the code of the demo."""
     show_code = st.sidebar.checkbox("Show code", True)
     if show_code:
