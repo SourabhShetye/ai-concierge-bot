@@ -745,6 +745,94 @@ async def handle_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         clear_user_state(user.id, context)
 
 
+
+# ============================================================================
+# BILLING HANDLER
+# ============================================================================
+
+async def calculate_bill(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Display the running bill for the user's current table.
+
+    Context resolution order (never asks if table already known):
+      1. user_ctx["table_number"]  — in-memory, set this session
+      2. user_sessions DB row      — persists across restarts/redeploys
+      3. Only if genuinely absent  — ask the user for table number
+
+    Math: Python sum() over price column floats — never an LLM.
+    The $8 + $4 = $13 hallucination bug is impossible here.
+    """
+    user      = update.effective_user
+    user_ctx  = get_user_context(user.id, context)
+
+    table_number  = user_ctx.get("table_number")
+    restaurant_id = user_ctx.get("restaurant_id")
+
+    # ── 1. Try DB session if not in memory ───────────────────────────────────
+    if not table_number:
+        try:
+            sess = supabase.table("user_sessions") \
+                .select("table_number") \
+                .eq("user_id", str(user.id)) \
+                .execute()
+            if sess.data and sess.data[0].get("table_number"):
+                table_number = str(sess.data[0]["table_number"])
+                user_ctx["table_number"] = table_number    # cache in memory
+        except Exception as e:
+            print(f"[BILL] Session lookup error: {e}")
+
+    # ── 2. Still unknown — ask once ───────────────────────────────────────────
+    if not table_number:
+        set_user_state(user.id, UserState.AWAITING_TABLE, context)
+        await update.message.reply_text(
+            "🪑 *What is your table number?*\n"
+            "_(I will pull up your bill right after!)_",
+            parse_mode="Markdown"
+        )
+        return
+
+    # ── 3. Fetch unpaid orders for this table ────────────────────────────────
+    try:
+        res = supabase.table("orders") \
+            .select("items, price") \
+            .eq("user_id", str(user.id)) \
+            .eq("restaurant_id", restaurant_id) \
+            .eq("table_number", str(table_number)) \
+            .neq("status", "paid") \
+            .neq("status", "cancelled") \
+            .execute()
+
+        if not res.data:
+            await update.message.reply_text(
+                f"🧾 *Table {table_number} — No active orders found.*",
+                parse_mode="Markdown"
+            )
+            return
+
+        # ── Python sum — deterministic, never an LLM ─────────────────────
+        total = round(sum(float(row["price"]) for row in res.data), 2)
+
+        lines = ["\n".join(
+            f"  • {row['items']}  —  ${float(row['price']):.2f}"
+            for row in res.data
+        )]
+        line_block = "\n".join(lines)
+
+        await update.message.reply_text(
+            f"🧾 *Your Bill — Table {table_number}*\n\n"
+            f"{line_block}\n\n"
+            f"💰 *Total: ${total:.2f}*\n\n"
+            f"_(Ask a waiter to process payment)_",
+            parse_mode="Markdown"
+        )
+
+    except Exception as e:
+        print(f"[BILL ERROR] {e}")
+        await update.message.reply_text(
+            "❌ Error fetching bill. Please ask staff for assistance."
+        )
+
+
 # ============================================================================
 # MAIN MESSAGE HANDLER (State Router)
 # ============================================================================
@@ -807,6 +895,16 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                      "what do you have", "show me food", "food list"]
     if any(kw in text_lower for kw in menu_keywords):
         await _send_menu(update.message, user_ctx)
+        return
+
+    # ── 5b. BILLING KEYWORD INTERCEPT ────────────────────────────────────────
+    # Catches "bill please", "check please", "what's my total", "how much do I owe"
+    # Routed here BEFORE order processing so billing keywords don't accidentally
+    # trigger a food-order attempt.
+    bill_keywords = ["bill", "check please", "the check", "my total",
+                     "how much", "pay", "invoice", "receipt"]
+    if any(kw in text_lower for kw in bill_keywords):
+        await calculate_bill(update, context)
         return
 
     # ── 6. ORDER PROCESSING ──────────────────────────────────────────────────
