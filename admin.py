@@ -7,10 +7,27 @@ import streamlit as st
 import pandas as pd
 import requests
 import os
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from streamlit_autorefresh import st_autorefresh
 from dotenv import load_dotenv
 from supabase import create_client
+
+# Dubai is UTC+4 — all timestamps from Supabase are stored in UTC.
+# Every display conversion must add this offset.
+DUBAI_TZ  = ZoneInfo("Asia/Dubai")
+UTC_PLUS4 = timedelta(hours=4)
+
+
+def to_dubai(utc_dt: datetime) -> datetime:
+    """
+    Convert a UTC-aware or UTC-naive datetime to Dubai time (UTC+4).
+    Supabase returns ISO strings in UTC; this helper centralises the conversion
+    so the +4 offset is applied consistently in every tab.
+    """
+    if utc_dt.tzinfo is None:
+        utc_dt = utc_dt.replace(tzinfo=timezone.utc)
+    return utc_dt.astimezone(DUBAI_TZ)
 
 # ============================================================================
 # PAGE CONFIGURATION
@@ -72,8 +89,8 @@ def format_currency(amount: float) -> str:
 
 
 def get_timestamp() -> str:
-    """Get current timestamp for logging"""
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    """Get current timestamp in Dubai time (UTC+4) for the dashboard footer."""
+    return datetime.now(DUBAI_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 
 # ============================================================================
@@ -205,13 +222,16 @@ with tab1:
                     # Party size
                     col3.write(f"👥 {booking['party_size']} guests")
                     
-                    # Booking time
+                    # Booking time — convert UTC → Dubai (UTC+4) before display
                     try:
-                        booking_dt = datetime.fromisoformat(booking['booking_time'].replace('Z', '+00:00'))
-                        time_str = booking_dt.strftime("%b %d, %I:%M %p")
-                    except:
+                        booking_dt_utc = datetime.fromisoformat(
+                            booking['booking_time'].replace('Z', '+00:00')
+                        )
+                        booking_dt_dubai = to_dubai(booking_dt_utc)
+                        time_str = booking_dt_dubai.strftime("%b %d, %I:%M %p (Dubai)")
+                    except Exception:
                         time_str = booking['booking_time']
-                    
+
                     col4.write(f"📅 {time_str}")
                     
                     # Status badge
@@ -286,12 +306,32 @@ with tab2:
                     header_col2.markdown(f"**{order['customer_name']}**")
                     
                     # Calculate time since order
+                    # Both sides MUST be timezone-aware UTC so Render's server
+                    # clock (UTC) produces the correct elapsed-time diff.
+                    # We then display the order's wall-clock time in Dubai.
                     try:
-                        created_at = datetime.fromisoformat(order['created_at'].replace('Z', '+00:00'))
-                        time_ago = datetime.now() - created_at.replace(tzinfo=None)
-                        minutes_ago = int(time_ago.total_seconds() / 60)
-                        header_col3.caption(f"⏱️ {minutes_ago} min ago")
-                    except:
+                        created_utc = datetime.fromisoformat(
+                            order['created_at'].replace('Z', '+00:00')
+                        )
+                        # Elapsed time: compare two UTC-aware datetimes
+                        now_utc      = datetime.now(timezone.utc)
+                        elapsed_secs = (now_utc - created_utc).total_seconds()
+                        minutes_ago  = max(0, int(elapsed_secs / 60))
+
+                        # Display time in Dubai local clock for kitchen staff
+                        created_dubai = to_dubai(created_utc)
+                        wall_clock    = created_dubai.strftime("%I:%M %p")
+
+                        if minutes_ago == 0:
+                            header_col3.caption(f"⏱️ Just now  ({wall_clock})")
+                        elif minutes_ago < 60:
+                            header_col3.caption(f"⏱️ {minutes_ago} min ago  ({wall_clock})")
+                        else:
+                            hours = minutes_ago // 60
+                            mins  = minutes_ago % 60
+                            header_col3.caption(f"⏱️ {hours}h {mins}m ago  ({wall_clock})")
+                    except Exception as e:
+                        print(f"[KDS TIME] {e}")
                         header_col3.caption("⏱️ Just now")
                     
                     # Order items
