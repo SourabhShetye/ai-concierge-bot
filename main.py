@@ -116,63 +116,63 @@ def get_dubai_now() -> datetime:
 
 async def parse_booking_time(user_input: str) -> Optional[datetime]:
     """
-    Parse natural language time input into datetime.
+    Parse natural language time input into datetime using Groq AI.
     Returns None if invalid or in the past.
+
+    IMPORTANT: This is async because FastAPI/python-telegram-bot run on an
+    already-running asyncio event loop. Calling loop.run_until_complete() from
+    within a running loop raises RuntimeError and silently kills the booking flow.
     """
+    import json
+
+    prompt = f"""
+    Current Dubai Time: {get_dubai_now().strftime('%Y-%m-%d %H:%M')}
+
+    Parse this booking request into a datetime: "{user_input}"
+
+    Return ONLY a JSON object (no extra text):
+    {{"datetime": "YYYY-MM-DD HH:MM", "valid": true}}
+
+    Rules:
+    - "tomorrow 8pm" = tomorrow at 20:00
+    - "12 july 4pm" = July 12 of the current or next year at 16:00
+    - "friday 7:30pm" = next Friday at 19:30
+    - Past times are invalid → return {{"valid": false}}
+    - If ambiguous, return {{"valid": false}}
+    """
+
     try:
-        # Use Groq to parse natural language
-        prompt = f"""
-        Current Dubai Time: {get_dubai_now().strftime('%Y-%m-%d %H:%M')}
-        
-        Parse this booking request into a datetime: "{user_input}"
-        
-        Return ONLY a JSON object:
-        {{"datetime": "YYYY-MM-DD HH:MM", "valid": true}}
-        
-        Rules:
-        - "tomorrow 8pm" = tomorrow at 20:00
-        - "friday 7:30pm" = next Friday at 19:30
-        - Past times are invalid (valid: false)
-        - If ambiguous, return valid: false
-        """
-        
-        # FIX: Directly await the async call
         completion = await groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0
+            temperature=0,
+            max_tokens=60
         )
-        
         response = completion.choices[0].message.content
-        
-        # Extract JSON
-        import json
+
         start = response.find("{")
-        end = response.rfind("}") + 1
+        end   = response.rfind("}") + 1
         if start == -1 or end == 0:
+            print(f"[TIME PARSE] No JSON in response: {response!r}")
             return None
-        
+
         data = json.loads(response[start:end])
-        
+
         if not data.get("valid"):
             return None
-        
-        # Parse datetime string
-        dt_str = data["datetime"]
-        parsed_dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M")
-        
-        # Add Dubai timezone
+
+        parsed_dt = datetime.strptime(data["datetime"], "%Y-%m-%d %H:%M")
         parsed_dt = parsed_dt.replace(tzinfo=DUBAI_TZ)
-        
-        # Validate not in past
+
         if parsed_dt <= get_dubai_now():
             return None
-        
+
         return parsed_dt
-        
+
     except Exception as e:
         print(f"[TIME PARSE ERROR] {e}")
         return None
+
 
 def check_availability(restaurant_id: str, booking_time: datetime) -> bool:
     """
@@ -430,22 +430,65 @@ async def cancel_order_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Handle all inline button callbacks.
+
+    CRITICAL: When a CallbackQuery fires, update.message is ALWAYS None.
+    The message lives on update.callback_query.message (aliased as query.message).
+    Never pass `update` into a handler that calls update.message.reply_text()
+    from a callback context — always reply via query.message directly.
     """
     query = update.callback_query
-    await query.answer()
-    
+    await query.answer()  # Removes the "loading" spinner on the button
+
     user = update.effective_user
     data = query.data
-    
+
     if data == "menu":
-        # Show menu via callback
-        await menu_handler(update, context)
-    
+        # --- FIX: inline the menu reply using query.message, not update.message ---
+        user_ctx = get_user_context(user.id, context)
+        restaurant_id = user_ctx.get("restaurant_id")
+
+        if not restaurant_id:
+            await query.message.reply_text("❌ Please use /start first to select a restaurant.")
+            return
+
+        try:
+            menu_items = supabase.table("menu_items")\
+                .select("content")\
+                .eq("restaurant_id", restaurant_id)\
+                .execute()
+
+            if not menu_items.data:
+                await query.message.reply_text("📋 Menu is currently unavailable.")
+                return
+
+            menu_text = "🍽️ *OUR MENU*\n"
+            current_category = None
+
+            for item in menu_items.data:
+                for line in item["content"].split("\n"):
+                    if line.startswith("category:"):
+                        cat = line.replace("category:", "").strip()
+                        if cat != current_category:
+                            menu_text += f"\n*{cat.upper()}*\n"
+                            current_category = cat
+                    elif line.startswith("item:"):
+                        menu_text += f"• {line.replace('item:', '').strip()}\n"
+                    elif line.startswith("price:"):
+                        menu_text += f"  {line.replace('price:', '').strip()}\n"
+                    elif line.startswith("description:"):
+                        menu_text += f"  _{line.replace('description:', '').strip()}_\n"
+
+            await query.message.reply_text(menu_text, parse_mode="Markdown")
+
+        except Exception as e:
+            print(f"[MENU BUTTON ERROR] {e}")
+            await query.message.reply_text("❌ Error loading menu. Please try /menu instead.")
+
     elif data == "book":
         # Start booking flow
         set_user_state(user.id, UserState.AWAITING_GUESTS, context)
         await query.message.reply_text("📅 Great! How many guests? (e.g., '4' or 'party of 6')")
-    
+
     elif data == "get_table":
         # Start table assignment flow
         set_user_state(user.id, UserState.AWAITING_TABLE, context)
@@ -528,6 +571,9 @@ async def handle_booking_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
         
         # Create booking
+        # NOTE: chat_id is NOT inserted into bookings — that column does not
+        # exist on the bookings table (it lives on orders only). Inserting it
+        # causes a PGRST204 schema-cache error and kills every booking attempt.
         try:
             booking_data = {
                 "restaurant_id": restaurant_id,
@@ -535,8 +581,7 @@ async def handle_booking_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
                 "customer_name": user.full_name or "Guest",
                 "party_size": party_size,
                 "booking_time": booking_time.strftime("%Y-%m-%d %H:%M:%S%z"),
-                "status": "confirmed",
-                "chat_id": str(update.effective_chat.id)
+                "status": "confirmed"
             }
             
             supabase.table("bookings").insert(booking_data).execute()
@@ -700,14 +745,25 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_general_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Handle general queries using AI when not in specific flow.
+    Always scoped to the user's current restaurant_id so that menu items
+    from other restaurants are never exposed.
     """
     user = update.effective_user
     text = update.message.text.strip()
     user_ctx = get_user_context(user.id, context)
     restaurant_id = user_ctx.get("restaurant_id")
-    
+
+    # Guard: restaurant_id must be set. Without this, the Supabase query has
+    # no restaurant filter and would return items from every restaurant.
+    if not restaurant_id:
+        await update.message.reply_text(
+            "👋 Please use /start to begin.\n"
+            "That will connect you to the right restaurant."
+        )
+        return
+
     try:
-        # Get menu context
+        # Get menu context — always filtered to THIS restaurant only
         menu_items = supabase.table("menu_items")\
             .select("content")\
             .eq("restaurant_id", restaurant_id)\
@@ -774,8 +830,7 @@ async def telegram_webhook(request: Request):
         return {"status": "error", "message": str(e)}
 
 
-# Change @app.get("/") to this:
-@app.api_route("/", methods=["GET", "HEAD"])
+@app.get("/")
 async def health_check():
     """Health check endpoint"""
     return {
