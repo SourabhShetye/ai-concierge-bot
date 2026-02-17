@@ -1,11 +1,31 @@
 """
-Restaurant AI Concierge - Main FastAPI/Telegram Bot
-Production-Ready Version with State Machine
+Restaurant AI Concierge — main.py  v4
+======================================
+Changes from v3:
+  MODE ISOLATION
+    Three strict context modes entered via /start inline buttons:
+      MODE_BOOKING  — only booking inputs accepted
+      MODE_DINING   — ordering, menu, bill, general chat
+      MODE_TABLE    — only digit input accepted
+    Cross-mode attempts get a clear redirect message + "⬅️ Main Menu" button.
+
+  ORDER IDs
+    process_order() now returns (reply, order_id).
+    Confirmation message always shows "Order #123".
+
+  EXPLICIT MODIFICATION FLOW
+    /cancel and natural-language mod requests enter AWAITING_ORDER_ID state.
+    User must type the order number.  main.py validates ownership via
+    order_service.fetch_order_for_user() before calling stage_modification()
+    or stage_cancellation().
+
+  BILLING
+    calculate_bill() unchanged — Python sum, no LLM, session-aware.
 """
 
 import os
 import re
-import asyncio
+import json
 from datetime import datetime, timedelta
 from enum import Enum
 from typing import Optional, Dict, Any
@@ -25,84 +45,119 @@ from supabase import create_client, Client
 from dotenv import load_dotenv
 from groq import AsyncGroq
 
-from order_service import process_order
-
-# ============================================================================
-# CONFIGURATION & INITIALIZATION
-# ============================================================================
+from order_service import (
+    process_order,
+    fetch_order_for_user,
+    stage_cancellation,
+    stage_modification,
+)
 
 load_dotenv()
 
-# Environment Variables
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+SUPABASE_URL   = os.getenv("SUPABASE_URL")
+SUPABASE_KEY   = os.getenv("SUPABASE_KEY")
+GROQ_API_KEY   = os.getenv("GROQ_API_KEY")
 
-# Clients
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-groq_client = AsyncGroq(api_key=GROQ_API_KEY)
-
-# FastAPI App
-app = FastAPI(title="Restaurant Concierge API")
-
-# Telegram Application (Global)
+supabase:     Client      = create_client(SUPABASE_URL, SUPABASE_KEY)
+groq_client:  AsyncGroq   = AsyncGroq(api_key=GROQ_API_KEY)
+app:          FastAPI      = FastAPI(title="Restaurant Concierge API")
 telegram_app: Optional[Application] = None
 
-# Dubai Timezone
 DUBAI_TZ = ZoneInfo("Asia/Dubai")
 
+
 # ============================================================================
-# STATE MACHINE ENUMS
+# STATE & MODE ENUMS
 # ============================================================================
 
 class UserState(str, Enum):
     """
-    Explicit states to prevent feedback loop bugs.
-    Users can ONLY be in ONE state at a time.
+    Fine-grained state within the current mode.
+    NEVER mix states from different modes — the mode layer enforces isolation.
     """
-    IDLE = "idle"                          # Default state, no active flow
-    AWAITING_GUESTS = "awaiting_guests"    # Booking: waiting for party size
-    AWAITING_TIME = "awaiting_time"        # Booking: waiting for time input
-    AWAITING_TABLE = "awaiting_table"      # Ordering: waiting for table number
-    AWAITING_FEEDBACK = "awaiting_feedback" # Payment complete, waiting for ratings
-    HAS_TABLE = "has_table"                # User has table, can order freely
+    IDLE                = "idle"
+    # Booking mode states
+    AWAITING_GUESTS     = "awaiting_guests"
+    AWAITING_TIME       = "awaiting_time"
+    # Dining mode states
+    AWAITING_TABLE      = "awaiting_table"
+    HAS_TABLE           = "has_table"
+    AWAITING_ORDER_ID   = "awaiting_order_id"   # NEW: user must type order number
+    # Cross-mode
+    AWAITING_FEEDBACK   = "awaiting_feedback"
+
+
+class Mode(str, Enum):
+    """
+    Top-level context mode.  Set once when the user presses a main-menu button.
+    Cleared by /start or pressing ⬅️ Main Menu.
+    """
+    NONE    = "none"     # At /start, no mode selected
+    BOOKING = "booking"  # 📅 Book a Table
+    DINING  = "dining"   # 🍽️ View Menu & Order
+    TABLE   = "table"    # 🪑 Set Table Number
+
 
 # ============================================================================
-# STATE MANAGEMENT HELPERS
+# STATE HELPERS
 # ============================================================================
 
-def get_user_state(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> UserState:
-    """
-    Retrieve current user state from context.
-    Default is IDLE if not set.
-    """
-    return context.user_data.get(f"state_{user_id}", UserState.IDLE)
+def get_user_state(uid: int, ctx: ContextTypes.DEFAULT_TYPE) -> UserState:
+    return ctx.user_data.get(f"state_{uid}", UserState.IDLE)
+
+def set_user_state(uid: int, state: UserState, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data[f"state_{uid}"] = state
+    print(f"[STATE] {uid} → {state.value}")
+
+def clear_user_state(uid: int, ctx: ContextTypes.DEFAULT_TYPE):
+    set_user_state(uid, UserState.IDLE, ctx)
+
+def get_user_context(uid: int, ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
+    key = f"context_{uid}"
+    if key not in ctx.user_data:
+        ctx.user_data[key] = {}
+    return ctx.user_data[key]
+
+def get_mode(uid: int, ctx: ContextTypes.DEFAULT_TYPE) -> Mode:
+    user_ctx = get_user_context(uid, ctx)
+    return Mode(user_ctx.get("mode", Mode.NONE))
+
+def set_mode(uid: int, mode: Mode, ctx: ContextTypes.DEFAULT_TYPE):
+    user_ctx = get_user_context(uid, ctx)
+    user_ctx["mode"] = mode.value
+    print(f"[MODE]  {uid} → {mode.value}")
+
+def clear_mode(uid: int, ctx: ContextTypes.DEFAULT_TYPE):
+    set_mode(uid, Mode.NONE, ctx)
 
 
-def set_user_state(user_id: int, state: UserState, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Set user state in context storage.
-    """
-    context.user_data[f"state_{user_id}"] = state
-    print(f"[STATE] User {user_id} -> {state.value}")
+# ============================================================================
+# SHARED UI HELPERS
+# ============================================================================
 
+def main_menu_keyboard() -> InlineKeyboardMarkup:
+    """The /start main menu — three clearly separated mode buttons."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🍽️ View Menu & Order",  callback_data="mode_dining")],
+        [InlineKeyboardButton("📅 Book a Table",        callback_data="mode_booking")],
+        [InlineKeyboardButton("🪑 Set Table Number",    callback_data="mode_table")],
+    ])
 
-def clear_user_state(user_id: int, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Reset user to IDLE state.
-    """
-    set_user_state(user_id, UserState.IDLE, context)
+def back_button() -> InlineKeyboardMarkup:
+    """Single ⬅️ Main Menu button attached to every mode-entry message."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ Main Menu", callback_data="main_menu")]
+    ])
 
-
-def get_user_context(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
-    """
-    Get user's temporary context data (restaurant_id, table_number, etc.)
-    """
-    key = f"context_{user_id}"
-    if key not in context.user_data:
-        context.user_data[key] = {}
-    return context.user_data[key]
+async def send_main_menu(message, restaurant_name: str, first_name: str):
+    """Send or re-send the /start welcome screen."""
+    await message.reply_text(
+        f"👋 Welcome to *{restaurant_name}*, {first_name}!\n\n"
+        f"Please choose an option to get started:",
+        reply_markup=main_menu_keyboard(),
+        parse_mode="Markdown",
+    )
 
 
 # ============================================================================
@@ -110,285 +165,252 @@ def get_user_context(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> Dict[s
 # ============================================================================
 
 def get_dubai_now() -> datetime:
-    """Get current time in Dubai timezone"""
     return datetime.now(DUBAI_TZ)
-
 
 async def parse_booking_time(user_input: str) -> Optional[datetime]:
     """
-    Parse natural language time input into datetime using Groq AI.
+    Parse natural-language booking time via Groq.
     Returns None if invalid or in the past.
-
-    IMPORTANT: This is async because FastAPI/python-telegram-bot run on an
-    already-running asyncio event loop. Calling loop.run_until_complete() from
-    within a running loop raises RuntimeError and silently kills the booking flow.
     """
-    import json
-
     prompt = f"""
-    Current Dubai Time: {get_dubai_now().strftime('%Y-%m-%d %H:%M')}
+Current Dubai Time: {get_dubai_now().strftime('%Y-%m-%d %H:%M')}
 
-    Parse this booking request into a datetime: "{user_input}"
+Parse this booking request: "{user_input}"
 
-    Return ONLY a JSON object (no extra text):
-    {{"datetime": "YYYY-MM-DD HH:MM", "valid": true}}
+Return ONLY JSON (no extra text):
+{{"datetime": "YYYY-MM-DD HH:MM", "valid": true}}
 
-    Rules:
-    - "tomorrow 8pm" = tomorrow at 20:00
-    - "12 july 4pm" = July 12 of the current or next year at 16:00
-    - "friday 7:30pm" = next Friday at 19:30
-    - Past times are invalid → return {{"valid": false}}
-    - If ambiguous, return {{"valid": false}}
-    """
-
+Rules:
+- "tomorrow 8pm" = tomorrow at 20:00
+- Past times → {{"valid": false}}
+- Ambiguous  → {{"valid": false}}
+"""
     try:
         completion = await groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0,
-            max_tokens=60
+            temperature=0, max_tokens=60,
         )
-        response = completion.choices[0].message.content
-
-        start = response.find("{")
-        end   = response.rfind("}") + 1
-        if start == -1 or end == 0:
-            print(f"[TIME PARSE] No JSON in response: {response!r}")
+        raw = completion.choices[0].message.content
+        s, e = raw.find("{"), raw.rfind("}") + 1
+        if s == -1 or e == 0:
             return None
-
-        data = json.loads(response[start:end])
-
+        data = json.loads(raw[s:e])
         if not data.get("valid"):
             return None
-
-        parsed_dt = datetime.strptime(data["datetime"], "%Y-%m-%d %H:%M")
-        parsed_dt = parsed_dt.replace(tzinfo=DUBAI_TZ)
-
-        if parsed_dt <= get_dubai_now():
-            return None
-
-        return parsed_dt
-
+        dt = datetime.strptime(data["datetime"], "%Y-%m-%d %H:%M")
+        dt = dt.replace(tzinfo=DUBAI_TZ)
+        return dt if dt > get_dubai_now() else None
     except Exception as e:
         print(f"[TIME PARSE ERROR] {e}")
         return None
 
-
 def check_availability(restaurant_id: str, booking_time: datetime) -> bool:
-    """
-    Check if restaurant has capacity at requested time.
-    Returns True if available, False if fully booked.
-    """
     try:
-        # Format time for query
-        time_str = booking_time.strftime("%Y-%m-%d %H:%M:%S%z")
-        
-        # Count existing bookings at this time (not cancelled)
-        response = supabase.table("bookings")\
-            .select("id", count="exact")\
-            .eq("restaurant_id", restaurant_id)\
-            .eq("booking_time", time_str)\
-            .neq("status", "cancelled")\
+        res = supabase.table("bookings") \
+            .select("id", count="exact") \
+            .eq("restaurant_id", restaurant_id) \
+            .eq("booking_time", booking_time.strftime("%Y-%m-%d %H:%M:%S%z")) \
+            .neq("status", "cancelled") \
             .execute()
-        
-        count = response.count or 0
-        
-        # Hard limit: 10 tables
-        return count < 10
-        
+        return (res.count or 0) < 10
     except Exception as e:
-        print(f"[AVAILABILITY ERROR] {e}")
-        return False  # Fail safe
+        print(f"[AVAIL ERROR] {e}")
+        return False
 
-
-def check_duplicate_booking(user_id: int, restaurant_id: str, booking_time: datetime) -> bool:
-    """
-    Check if user already has a booking at this time.
-    Returns True if duplicate exists.
-    """
+def check_duplicate_booking(uid: int, restaurant_id: str, booking_time: datetime) -> bool:
     try:
-        time_str = booking_time.strftime("%Y-%m-%d %H:%M:%S%z")
-        
-        response = supabase.table("bookings")\
-            .select("id")\
-            .eq("user_id", str(user_id))\
-            .eq("restaurant_id", restaurant_id)\
-            .eq("booking_time", time_str)\
-            .neq("status", "cancelled")\
+        res = supabase.table("bookings") \
+            .select("id") \
+            .eq("user_id", str(uid)) \
+            .eq("restaurant_id", restaurant_id) \
+            .eq("booking_time", booking_time.strftime("%Y-%m-%d %H:%M:%S%z")) \
+            .neq("status", "cancelled") \
             .execute()
-        
-        return len(response.data) > 0
-        
+        return bool(res.data)
     except Exception as e:
-        print(f"[DUPLICATE CHECK ERROR] {e}")
+        print(f"[DUP CHECK ERROR] {e}")
         return False
 
 
 # ============================================================================
-# COMMAND HANDLERS
+# /start HANDLER
 # ============================================================================
 
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /start command - Initialize user and handle restaurant selection.
-    Supports: /start rest_id=ABC123
-
-    Captures and stores restaurant_name alongside restaurant_id so the
-    welcome message can greet "Welcome to [Name]!" and downstream handlers
-    never need an extra DB round-trip just to display the restaurant name.
+    /start — initialise session, clear all modes and states, show main menu.
     """
-    user = update.effective_user
+    user    = update.effective_user
     chat_id = update.effective_chat.id
 
     restaurant_id   = None
-    restaurant_name = "Our Restaurant"   # safe fallback if DB has no name column
+    restaurant_name = "Our Restaurant"
 
-    # --- Parse restaurant ID from command args ---
     if context.args:
         arg = context.args[0]
-        if arg.startswith("rest_id="):
-            restaurant_id = arg.split("=")[1]
-        else:
-            restaurant_id = arg           # support bare IDs as well
-
-    # --- Validate the provided ID (or fall back to first restaurant) ---
-    if restaurant_id:
+        rid = arg.split("=")[1] if arg.startswith("rest_id=") else arg
         try:
-            rest_check = supabase.table("restaurants")\
-                .select("id, name")\
-                .eq("id", restaurant_id)\
-                .execute()
-
-            if rest_check.data:
-                restaurant_name = rest_check.data[0].get("name", restaurant_name)
-            else:
-                restaurant_id = None      # invalid ID → trigger fallback below
+            chk = supabase.table("restaurants").select("id,name").eq("id", rid).execute()
+            if chk.data:
+                restaurant_id   = chk.data[0]["id"]
+                restaurant_name = chk.data[0].get("name", restaurant_name)
         except Exception as e:
-            print(f"[START] Restaurant lookup error: {e}")
-            restaurant_id = None
+            print(f"[START] lookup error: {e}")
 
     if not restaurant_id:
         try:
-            default = supabase.table("restaurants")\
-                .select("id, name")\
-                .limit(1)\
-                .execute()
-
-            if default.data:
-                restaurant_id   = default.data[0]["id"]
-                restaurant_name = default.data[0].get("name", restaurant_name)
+            dflt = supabase.table("restaurants").select("id,name").limit(1).execute()
+            if dflt.data:
+                restaurant_id   = dflt.data[0]["id"]
+                restaurant_name = dflt.data[0].get("name", restaurant_name)
             else:
-                await update.message.reply_text("❌ System Error: No restaurants configured.")
+                await update.message.reply_text("❌ No restaurants configured.")
                 return
         except Exception as e:
-            print(f"[START] Default restaurant error: {e}")
-            await update.message.reply_text("❌ System Error: Unable to connect to restaurant.")
+            print(f"[START] default error: {e}")
+            await update.message.reply_text("❌ Cannot connect to restaurant.")
             return
 
-    # --- Persist to user context (in-memory + DB) ---
     user_ctx = get_user_context(user.id, context)
     user_ctx["restaurant_id"]   = restaurant_id
     user_ctx["restaurant_name"] = restaurant_name
     user_ctx["chat_id"]         = chat_id
 
-    # Restore table_number from DB if the user already had one
-    # (survives bot restarts — context.user_data is cleared on redeploy)
+    # Restore persisted table_number
     try:
-        session = supabase.table("user_sessions")\
-            .select("table_number")\
-            .eq("user_id", str(user.id))\
-            .execute()
-        if session.data and session.data[0].get("table_number"):
-            user_ctx["table_number"] = str(session.data[0]["table_number"])
+        sess = supabase.table("user_sessions") \
+            .select("table_number").eq("user_id", str(user.id)).execute()
+        if sess.data and sess.data[0].get("table_number"):
+            user_ctx["table_number"] = str(sess.data[0]["table_number"])
     except Exception as e:
-        print(f"[START] Session restore error: {e}")
+        print(f"[START] session restore: {e}")
 
-    # Upsert user to database
     try:
         supabase.table("users").upsert({
-            "id":        str(user.id),
-            "username":  user.username or "guest",
-            "full_name": user.full_name or "Guest",
-            "chat_id":   str(chat_id)
+            "id": str(user.id), "username": user.username or "guest",
+            "full_name": user.full_name or "Guest", "chat_id": str(chat_id),
         }).execute()
     except Exception as e:
-        print(f"[USER UPSERT ERROR] {e}")
+        print(f"[USER UPSERT] {e}")
 
-    # --- Welcome message with real restaurant name ---
-    keyboard = [
-        [InlineKeyboardButton("🍽️ View Menu",        callback_data="menu")],
-        [InlineKeyboardButton("📅 Book a Table",     callback_data="book")],
-        [InlineKeyboardButton("🪑 Set Table Number", callback_data="get_table")],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    welcome_text = (
-        f"👋 Welcome to *{restaurant_name}*, {user.first_name}!\n\n"
-        f"I'm your AI Concierge. How can I assist you today?"
-    )
-
-    await update.message.reply_text(welcome_text, reply_markup=reply_markup,
-                                    parse_mode="Markdown")
+    # Clear all state/mode — /start is always a hard reset
     clear_user_state(user.id, context)
+    clear_mode(user.id, context)
+    user_ctx.pop("pending_action", None)   # clear any in-flight mod intent
+
+    await send_main_menu(update.message, restaurant_name, user.first_name)
 
 
-async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ============================================================================
+# INLINE KEYBOARD BUTTON HANDLER
+# ============================================================================
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /help command - Show available commands and features.
+    All inline button presses.
+    CRITICAL: update.message is None for CallbackQuery — always use query.message.
     """
-    help_text = """
-🤖 **Restaurant AI Concierge**
+    query = update.callback_query
+    await query.answer()
+    user     = update.effective_user
+    data     = query.data
+    user_ctx = get_user_context(user.id, context)
 
-**Commands:**
-/start - Begin conversation
-/menu - View full menu
-/book - Make a reservation
-/table - Set your table number for ordering
-/cancel - Cancel your last order
-/help - Show this message
+    # ── Main Menu (mode exit) ────────────────────────────────────────────────
+    if data == "main_menu":
+        clear_user_state(user.id, context)
+        clear_mode(user.id, context)
+        user_ctx.pop("pending_action", None)
+        await send_main_menu(
+            query.message,
+            user_ctx.get("restaurant_name", "Our Restaurant"),
+            user.first_name,
+        )
+        return
 
-**Features:**
-✅ Natural language ordering ("I'll have 2 burgers and a coffee")
-✅ Modify orders ("Remove the fries")
-✅ Real-time kitchen updates
-✅ Instant feedback system
+    # ── Mode: DINING ─────────────────────────────────────────────────────────
+    if data == "mode_dining":
+        set_mode(user.id, Mode.DINING, context)
+        clear_user_state(user.id, context)
+        table = user_ctx.get("table_number")
+        if table:
+            set_user_state(user.id, UserState.HAS_TABLE, context)
+            await query.message.reply_text(
+                f"🍽️ *Dining Mode* — Table {table} active.\n\n"
+                f"What would you like to order? You can also ask about the menu or request your bill.",
+                reply_markup=back_button(),
+                parse_mode="Markdown",
+            )
+        else:
+            set_user_state(user.id, UserState.AWAITING_TABLE, context)
+            await query.message.reply_text(
+                "🍽️ *Dining Mode*\n\n"
+                "🪑 First, what is your table number?",
+                reply_markup=back_button(),
+                parse_mode="Markdown",
+            )
+        return
 
-Just chat naturally - I understand you! 🧠
-    """
-    
-    await update.message.reply_text(help_text)
+    # ── Mode: BOOKING ────────────────────────────────────────────────────────
+    if data == "mode_booking":
+        set_mode(user.id, Mode.BOOKING, context)
+        set_user_state(user.id, UserState.AWAITING_GUESTS, context)
+        await query.message.reply_text(
+            "📅 *Booking Mode*\n\n"
+            "How many guests will be dining? _(e.g. '4' or 'party of 6')_",
+            reply_markup=back_button(),
+            parse_mode="Markdown",
+        )
+        return
 
+    # ── Mode: TABLE ──────────────────────────────────────────────────────────
+    if data == "mode_table":
+        set_mode(user.id, Mode.TABLE, context)
+        set_user_state(user.id, UserState.AWAITING_TABLE, context)
+        await query.message.reply_text(
+            "🪑 *Set Table Number*\n\n"
+            "Please type your table number _(digits only)_:",
+            reply_markup=back_button(),
+            parse_mode="Markdown",
+        )
+        return
+
+    # ── Legacy menu button (from old sessions) ───────────────────────────────
+    if data == "menu":
+        await _send_menu(query.message, user_ctx)
+        return
+
+
+# ============================================================================
+# MENU HELPERS
+# ============================================================================
 
 async def _send_menu(message, user_ctx: dict) -> None:
     """
-    Shared menu-rendering helper used by:
-      - /menu command handler
-      - 🍽️ View Menu inline button
-      - "menu" keyword intercept in message_handler
-
-    Always fetches real rows from menu_items filtered by restaurant_id.
-    Never calls the LLM — we want the exact list, not a creative summary.
+    Fetch live menu_items and send as a structured text list.
+    Never calls the LLM — always DB rows.
     """
     restaurant_id   = user_ctx.get("restaurant_id")
     restaurant_name = user_ctx.get("restaurant_name", "Our Restaurant")
 
     if not restaurant_id:
-        await message.reply_text("❌ Please use /start first to select a restaurant.")
+        await message.reply_text("❌ Please use /start first.")
         return
 
     try:
-        rows = supabase.table("menu_items")\
-            .select("content")\
-            .eq("restaurant_id", restaurant_id)\
-            .execute()
+        rows = supabase.table("menu_items") \
+            .select("content").eq("restaurant_id", restaurant_id).execute()
 
         if not rows.data:
-            await message.reply_text("📋 Menu is currently unavailable. Please ask staff for assistance.")
+            await message.reply_text(
+                "📋 Menu unavailable. Please ask staff.",
+                reply_markup=back_button(),
+            )
             return
 
-        # Build structured plain-text menu — no LLM involved
-        menu_lines = [f"🍽️ *{restaurant_name} — Menu*\n"]
-        current_category = None
+        lines = [f"🍽️ *{restaurant_name} — Menu*\n"]
+        current_cat = None
 
         for row in rows.data:
             for line in row["content"].split("\n"):
@@ -397,303 +419,313 @@ async def _send_menu(message, user_ctx: dict) -> None:
                     continue
                 if line.startswith("category:"):
                     cat = line.replace("category:", "").strip()
-                    if cat != current_category:
-                        menu_lines.append(f"\n*{cat.upper()}*")
-                        current_category = cat
+                    if cat != current_cat:
+                        lines.append(f"\n*{cat.upper()}*")
+                        current_cat = cat
                 elif line.startswith("item:"):
-                    menu_lines.append(f"  • {line.replace('item:', '').strip()}")
+                    lines.append(f"  • {line.replace('item:', '').strip()}")
                 elif line.startswith("price:"):
-                    menu_lines[-1] += f"  —  {line.replace('price:', '').strip()}"
+                    lines[-1] += f"  —  {line.replace('price:', '').strip()}"
                 elif line.startswith("description:"):
-                    menu_lines.append(f"    _{line.replace('description:', '').strip()}_")
+                    lines.append(f"    _{line.replace('description:', '').strip()}_")
 
-        menu_lines.append("\n_Say the item name to order, e.g. 'I\'ll have the Full Stack Burger'_")
+        lines.append("\n_Tell me what you'd like and I'll place the order!_")
+        menu_text = "\n".join(lines)
 
-        menu_text = "\n".join(menu_lines)
-
-        # Telegram message limit is 4096 chars; split if needed
+        kb = back_button()
         if len(menu_text) <= 4096:
-            await message.reply_text(menu_text, parse_mode="Markdown")
+            await message.reply_text(menu_text, parse_mode="Markdown", reply_markup=kb)
         else:
-            # Split at the 4000-char mark on a newline boundary
-            chunk, rest = menu_text[:4000], menu_text[4000:]
-            await message.reply_text(chunk, parse_mode="Markdown")
-            await message.reply_text(rest,  parse_mode="Markdown")
+            await message.reply_text(menu_text[:4000], parse_mode="Markdown")
+            await message.reply_text(menu_text[4000:], parse_mode="Markdown", reply_markup=kb)
 
     except Exception as e:
         print(f"[MENU ERROR] {e}")
-        await message.reply_text("❌ Error loading menu. Please try again.")
+        await message.reply_text("❌ Error loading menu.")
 
 
 async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /menu command — delegates to _send_menu() for consistent rendering
-    across the command, inline button, and keyword intercept paths.
-    """
     user_ctx = get_user_context(update.effective_user.id, context)
     await _send_menu(update.message, user_ctx)
 
 
-async def cancel_order_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /cancel command - Request cancellation of last order.
-    """
-    user = update.effective_user
-    user_ctx = get_user_context(user.id, context)
-    restaurant_id = user_ctx.get("restaurant_id")
-    
-    try:
-        # Find most recent pending order
-        response = supabase.table("orders")\
-            .select("*")\
-            .eq("user_id", str(user.id))\
-            .eq("restaurant_id", restaurant_id)\
-            .eq("status", "pending")\
-            .neq("cancellation_status", "requested")\
-            .order("created_at", desc=True)\
-            .limit(1)\
-            .execute()
-        
-        if not response.data:
-            await update.message.reply_text("❌ No active orders to cancel.")
-            return
-        
-        order = response.data[0]
-        
-        # Request cancellation
-        supabase.table("orders")\
-            .update({"cancellation_status": "requested"})\
-            .eq("id", order["id"])\
-            .execute()
-        
-        await update.message.reply_text(
-            f"📩 **Cancellation Requested**\n"
-            f"Order ID: #{order['id']}\n"
-            f"Items: {order['items']}\n\n"
-            f"Kitchen will review your request shortly."
-        )
-        
-    except Exception as e:
-        print(f"[CANCEL ERROR] {e}")
-        await update.message.reply_text("❌ Error processing cancellation.")
-
-
 # ============================================================================
-# /table COMMAND HANDLER
+# /help HANDLER
 # ============================================================================
 
-async def table_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /table command — ask the user for their table number and enter AWAITING_TABLE.
-    This is the clean entry point; users can also be routed here via the inline
-    button or by saying "table 7" from any state (handled in message_handler).
-    """
-    user = update.effective_user
-    set_user_state(user.id, UserState.AWAITING_TABLE, context)
+async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🪑 *What is your table number?*\n"
-        "_(Just type the number, e.g. '7' or 'Table 12')_",
-        parse_mode="Markdown"
+        "🤖 *Restaurant AI Concierge*\n\n"
+        "*Commands:*\n"
+        "/start — Main menu\n"
+        "/menu  — View full menu\n"
+        "/cancel — Cancel an order by ID\n"
+        "/help  — This message\n\n"
+        "*How it works:*\n"
+        "1. Press *View Menu & Order* to enter Dining Mode\n"
+        "2. Set your table number once\n"
+        "3. Just type what you want — I'll handle the rest!\n\n"
+        "To modify an order, say: _\"modify order #123\"_ or use /cancel",
+        parse_mode="Markdown",
+        reply_markup=back_button(),
     )
 
 
 # ============================================================================
-# CALLBACK QUERY HANDLERS (Inline Buttons)
+# /cancel COMMAND — enters AWAITING_ORDER_ID state
 # ============================================================================
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cancel_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Handle all inline button callbacks.
-
-    CRITICAL: When a CallbackQuery fires, update.message is ALWAYS None.
-    The message lives on update.callback_query.message (aliased as query.message).
-    Never pass `update` into a handler that calls update.message.reply_text()
-    from a callback context — always reply via query.message directly.
+    /cancel — ask for the Order ID explicitly.
+    The blind "latest order" lookup is intentionally removed.
     """
-    query = update.callback_query
-    await query.answer()  # Removes the "loading" spinner on the button
-
-    user = update.effective_user
-    data = query.data
-
-    if data == "menu":
-        # Delegate to shared helper — query.message is the correct reply target
-        # for CallbackQuery updates (update.message is None in this context).
-        user_ctx = get_user_context(user.id, context)
-        await _send_menu(query.message, user_ctx)
-
-    elif data == "book":
-        # Start booking flow
-        set_user_state(user.id, UserState.AWAITING_GUESTS, context)
-        await query.message.reply_text("📅 Great! How many guests? (e.g., '4' or 'party of 6')")
-
-    elif data == "get_table":
-        # Start table assignment flow
-        set_user_state(user.id, UserState.AWAITING_TABLE, context)
-        await query.message.reply_text("🪑 What's your table number? (e.g., '5' or 'Table 12')")
-
-
-# ============================================================================
-# BOOKING FLOW HANDLERS
-# ============================================================================
-
-async def handle_booking_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, user_state: UserState):
-    """
-    Handle booking state machine logic.
-    """
-    user = update.effective_user
-    text = update.message.text.strip()
-    user_ctx = get_user_context(user.id, context)
-    
-    # STATE: AWAITING_GUESTS
-    if user_state == UserState.AWAITING_GUESTS:
-        # Extract party size
-        try:
-            # Try to extract number from text
-            numbers = re.findall(r'\d+', text)
-            if not numbers:
-                await update.message.reply_text("❌ Please provide a number (e.g., '4' or 'party of 6')")
-                return
-            
-            party_size = int(numbers[0])
-            
-            if party_size < 1 or party_size > 20:
-                await update.message.reply_text("❌ Party size must be between 1 and 20 guests.")
-                return
-            
-            # Store party size
-            user_ctx["party_size"] = party_size
-            
-            # Move to next state
-            set_user_state(user.id, UserState.AWAITING_TIME, context)
-            await update.message.reply_text(
-                f"✅ Table for {party_size} guests.\n\n"
-                "⏰ When would you like to dine?\n"
-                "(e.g., 'tomorrow 8pm', 'Friday 7:30pm', 'Jan 25 at 6pm')"
-            )
-            
-        except Exception as e:
-            print(f"[PARTY SIZE ERROR] {e}")
-            await update.message.reply_text("❌ Invalid input. Please enter a number.")
-    
-    # STATE: AWAITING_TIME
-    elif user_state == UserState.AWAITING_TIME:
-        # Parse booking time
-        booking_time = await parse_booking_time(text)
-        
-        if not booking_time:
-            await update.message.reply_text(
-                "❌ Invalid time or past date.\n\n"
-                "Please try again with:\n"
-                "• 'tomorrow 8pm'\n"
-                "• 'Friday 7:30pm'\n"
-                "• 'January 25 at 6pm'"
-            )
-            return
-        
-        restaurant_id = user_ctx.get("restaurant_id")
-        party_size = user_ctx.get("party_size")
-        
-        # Check for duplicate booking
-        if check_duplicate_booking(user.id, restaurant_id, booking_time):
-            await update.message.reply_text("❌ You already have a booking at this time!")
-            clear_user_state(user.id, context)
-            return
-        
-        # Check availability
-        if not check_availability(restaurant_id, booking_time):
-            await update.message.reply_text(
-                "❌ Sorry, we're fully booked at that time.\n\n"
-                "Please try a different time."
-            )
-            return
-        
-        # Create booking
-        # NOTE: chat_id is NOT inserted into bookings — that column does not
-        # exist on the bookings table (it lives on orders only). Inserting it
-        # causes a PGRST204 schema-cache error and kills every booking attempt.
-        try:
-            booking_data = {
-                "restaurant_id": restaurant_id,
-                "user_id": str(user.id),
-                "customer_name": user.full_name or "Guest",
-                "party_size": party_size,
-                "booking_time": booking_time.strftime("%Y-%m-%d %H:%M:%S%z"),
-                "status": "confirmed"
-            }
-            
-            supabase.table("bookings").insert(booking_data).execute()
-            
-            # Success message
-            await update.message.reply_text(
-                f"✅ **Booking Confirmed!**\n\n"
-                f"👥 Guests: {party_size}\n"
-                f"📅 Date: {booking_time.strftime('%B %d, %Y')}\n"
-                f"⏰ Time: {booking_time.strftime('%I:%M %p')}\n\n"
-                f"We look forward to serving you!"
-            )
-            
-            # Reset state
-            clear_user_state(user.id, context)
-            
-        except Exception as e:
-            print(f"[BOOKING ERROR] {e}")
-            await update.message.reply_text("❌ System error. Please try again later.")
-            clear_user_state(user.id, context)
-
-
-# ============================================================================
-# TABLE ASSIGNMENT HANDLER
-# ============================================================================
-
-async def handle_table_assignment(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Handle table number assignment flow.
-
-    Saves to TWO places so it is never forgotten:
-      1. user_ctx["table_number"]      — fast in-memory access for this session
-      2. supabase user_sessions table  — persists across bot restarts / redeployments
-
-    Without the DB write, a Render redeploy wipes context.user_data and the bot
-    loops asking for the table number on every restart.
-    """
-    user = update.effective_user
-    text = update.message.text.strip()
+    user     = update.effective_user
     user_ctx = get_user_context(user.id, context)
 
-    # Extract digits — accepts "table 7", "7", "Table 12", "I'm at table 3", etc.
-    numbers = re.findall(r'\d+', text)
-    if not numbers:
+    # Show their recent orders as a reference
+    restaurant_id = user_ctx.get("restaurant_id")
+    try:
+        recent = supabase.table("orders") \
+            .select("id, items, price") \
+            .eq("user_id", str(user.id)) \
+            .eq("restaurant_id", restaurant_id) \
+            .eq("status", "pending") \
+            .order("created_at", desc=True) \
+            .limit(5) \
+            .execute()
+
+        if not recent.data:
+            await update.message.reply_text(
+                "❌ You have no active orders to cancel.",
+                reply_markup=back_button(),
+            )
+            return
+
+        order_list = "\n".join(
+            f"  *#{o['id']}* — {o['items']}  (${float(o['price']):.2f})"
+            for o in recent.data
+        )
+        user_ctx["pending_action"] = "cancel"
+        set_user_state(user.id, UserState.AWAITING_ORDER_ID, context)
+
         await update.message.reply_text(
-            "❌ Please provide a table number (e.g., '5' or 'Table 12')"
+            f"📋 *Your active orders:*\n{order_list}\n\n"
+            f"Please type the *Order Number* you wish to cancel:",
+            reply_markup=back_button(),
+            parse_mode="Markdown",
+        )
+
+    except Exception as e:
+        print(f"[CANCEL CMD ERROR] {e}")
+        await update.message.reply_text("❌ Error fetching orders. Please try again.")
+
+
+# ============================================================================
+# /table COMMAND
+# ============================================================================
+
+async def table_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    set_mode(user.id, Mode.TABLE, context)
+    set_user_state(user.id, UserState.AWAITING_TABLE, context)
+    await update.message.reply_text(
+        "🪑 *Set Table Number*\n"
+        "Please type your table number _(digits only)_:",
+        reply_markup=back_button(),
+        parse_mode="Markdown",
+    )
+
+
+# ============================================================================
+# BOOKING FLOW
+# ============================================================================
+
+async def handle_booking_flow(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, state: UserState
+):
+    user     = update.effective_user
+    text     = update.message.text.strip()
+    user_ctx = get_user_context(user.id, context)
+
+    if state == UserState.AWAITING_GUESTS:
+        nums = re.findall(r'\d+', text)
+        if not nums:
+            await update.message.reply_text(
+                "❌ Please enter the number of guests (e.g. '4').",
+                reply_markup=back_button(),
+            )
+            return
+        party = int(nums[0])
+        if not (1 <= party <= 20):
+            await update.message.reply_text(
+                "❌ Party size must be between 1 and 20.",
+                reply_markup=back_button(),
+            )
+            return
+        user_ctx["party_size"] = party
+        set_user_state(user.id, UserState.AWAITING_TIME, context)
+        await update.message.reply_text(
+            f"✅ Table for *{party}* guests.\n\n"
+            f"⏰ When would you like to dine?\n"
+            f"_(e.g. 'tomorrow 8pm', 'Friday 7:30pm', 'Jan 25 at 6pm')_",
+            reply_markup=back_button(),
+            parse_mode="Markdown",
         )
         return
 
-    table_number = numbers[0]
+    if state == UserState.AWAITING_TIME:
+        booking_time = await parse_booking_time(text)
+        if not booking_time:
+            await update.message.reply_text(
+                "❌ Invalid or past time.\n\n"
+                "Try: _'tomorrow 8pm'_, _'Friday 7:30pm'_, _'Jan 25 at 6pm'_",
+                reply_markup=back_button(),
+                parse_mode="Markdown",
+            )
+            return
 
-    # 1. Store in memory context — used for all order checks this session
+        restaurant_id = user_ctx.get("restaurant_id")
+        party         = user_ctx.get("party_size")
+
+        if check_duplicate_booking(user.id, restaurant_id, booking_time):
+            await update.message.reply_text(
+                "❌ You already have a booking at that time.",
+                reply_markup=back_button(),
+            )
+            clear_user_state(user.id, context)
+            return
+
+        if not check_availability(restaurant_id, booking_time):
+            await update.message.reply_text(
+                "❌ Fully booked at that time. Please try another slot.",
+                reply_markup=back_button(),
+            )
+            return
+
+        try:
+            supabase.table("bookings").insert({
+                "restaurant_id": restaurant_id,
+                "user_id":       str(user.id),
+                "customer_name": user.full_name or "Guest",
+                "party_size":    party,
+                "booking_time":  booking_time.strftime("%Y-%m-%d %H:%M:%S%z"),
+                "status":        "confirmed",
+            }).execute()
+
+            await update.message.reply_text(
+                f"✅ *Booking Confirmed!*\n\n"
+                f"👥 Guests: {party}\n"
+                f"📅 {booking_time.strftime('%B %d, %Y at %I:%M %p')}\n\n"
+                f"We look forward to serving you!",
+                reply_markup=main_menu_keyboard(),
+                parse_mode="Markdown",
+            )
+            clear_user_state(user.id, context)
+            clear_mode(user.id, context)
+
+        except Exception as e:
+            print(f"[BOOKING ERROR] {e}")
+            await update.message.reply_text(
+                "❌ System error. Please try again.",
+                reply_markup=back_button(),
+            )
+            clear_user_state(user.id, context)
+
+
+# ============================================================================
+# TABLE ASSIGNMENT
+# ============================================================================
+
+async def handle_table_assignment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user     = update.effective_user
+    text     = update.message.text.strip()
+    user_ctx = get_user_context(user.id, context)
+    mode     = get_mode(user.id, context)
+
+    nums = re.findall(r'\d+', text)
+    if not nums:
+        await update.message.reply_text(
+            "❌ Please type just the table number (e.g. '7' or '12').",
+            reply_markup=back_button(),
+        )
+        return
+
+    table_number = nums[0]
     user_ctx["table_number"] = table_number
 
-    # 2. Persist to database — survives restarts
     try:
         supabase.table("user_sessions").upsert({
             "user_id":      str(user.id),
-            "table_number": table_number
+            "table_number": table_number,
         }).execute()
-        print(f"[TABLE] User {user.id} assigned to table {table_number} (saved to DB)")
+        print(f"[TABLE] {user.id} → table {table_number} (saved)")
     except Exception as e:
-        # Non-fatal: in-memory copy still works for this session
-        print(f"[TABLE] DB persist warning: {e}")
+        print(f"[TABLE] DB warning: {e}")
 
-    # 3. Advance state machine
+    # Auto-transition: if in TABLE mode, move to DINING mode after assignment
+    if mode == Mode.TABLE:
+        set_mode(user.id, Mode.DINING, context)
+
     set_user_state(user.id, UserState.HAS_TABLE, context)
 
     await update.message.reply_text(
         f"✅ *Table {table_number} confirmed!*\n\n"
-        f"You can now order — just tell me what you'd like!\n"
+        f"You're in Dining Mode. Just tell me what you'd like to order!\n"
         f"_Example: 'I'll have 2 Binary Bites and a Java Jolt'_",
-        parse_mode="Markdown"
+        reply_markup=back_button(),
+        parse_mode="Markdown",
     )
+
+
+# ============================================================================
+# ORDER ID HANDLER  (AWAITING_ORDER_ID state)
+# ============================================================================
+
+async def handle_order_id_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    The user has typed an order number in response to a /cancel or
+    "modify order #X" prompt.  Validate ownership then execute the action.
+    """
+    user     = update.effective_user
+    text     = update.message.text.strip()
+    user_ctx = get_user_context(user.id, context)
+
+    nums = re.findall(r'\d+', text)
+    if not nums:
+        await update.message.reply_text(
+            "❌ Please type a valid order number (digits only).",
+            reply_markup=back_button(),
+        )
+        return
+
+    order_id      = int(nums[0])
+    restaurant_id = user_ctx.get("restaurant_id")
+    action        = user_ctx.get("pending_action", "cancel")   # "cancel" or "modify"
+    mod_intent    = user_ctx.get("pending_mod_text", "")
+
+    order = fetch_order_for_user(order_id, str(user.id), restaurant_id)
+
+    if not order:
+        await update.message.reply_text(
+            f"❌ Order *#{order_id}* not found or doesn't belong to you.\n"
+            f"Please check the number and try again.",
+            reply_markup=back_button(),
+            parse_mode="Markdown",
+        )
+        return
+
+    # Clean up pending state
+    clear_user_state(user.id, context)
+    user_ctx.pop("pending_action", None)
+    user_ctx.pop("pending_mod_text", None)
+
+    if action == "cancel":
+        reply = stage_cancellation(order)
+    else:
+        reply = await stage_modification(order, mod_intent)
+
+    await update.message.reply_text(reply, parse_mode="Markdown", reply_markup=back_button())
 
 
 # ============================================================================
@@ -701,323 +733,420 @@ async def handle_table_assignment(update: Update, context: ContextTypes.DEFAULT_
 # ============================================================================
 
 async def handle_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Handle feedback/ratings from users.
-    CRITICAL: Only processes if user is in AWAITING_FEEDBACK state.
-    """
-    user = update.effective_user
-    text = update.message.text.strip()
-    
-    # Extract ratings (numbers 1-5)
+    user     = update.effective_user
+    text     = update.message.text.strip()
+    user_ctx = get_user_context(user.id, context)
+
     ratings = re.findall(r'\b[1-5]\b', text)
-    
     if not ratings:
         await update.message.reply_text(
-            "Please provide ratings (1-5 stars) for each dish and overall experience."
+            "Please provide ratings (1-5) for each dish and overall experience."
         )
         return
-    
-    # Store feedback in database
+
     try:
-        user_ctx = get_user_context(user.id, context)
-        restaurant_id = user_ctx.get("restaurant_id")
-        
-        feedback_data = {
-            "restaurant_id": restaurant_id,
-            "user_id": str(user.id),
-            "ratings": text,
-            "created_at": get_dubai_now().isoformat()
-        }
-        
-        supabase.table("feedback").insert(feedback_data).execute()
-        
+        supabase.table("feedback").insert({
+            "restaurant_id": user_ctx.get("restaurant_id"),
+            "user_id":       str(user.id),
+            "ratings":       text,
+            "created_at":    get_dubai_now().isoformat(),
+        }).execute()
         await update.message.reply_text(
-            "⭐ Thank you for your feedback!\n\n"
-            "We appreciate your time and hope to see you again soon! 😊"
+            "⭐ Thank you for your feedback!\n\nWe hope to see you again soon! 😊",
+            reply_markup=main_menu_keyboard(),
         )
-        
-        # Reset state
         clear_user_state(user.id, context)
-        
     except Exception as e:
         print(f"[FEEDBACK ERROR] {e}")
         await update.message.reply_text("✅ Feedback received. Thank you!")
         clear_user_state(user.id, context)
 
 
-
 # ============================================================================
-# BILLING HANDLER
+# BILLING
 # ============================================================================
 
 async def calculate_bill(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Display the running bill for the user's current table.
-
-    Context resolution order (never asks if table already known):
-      1. user_ctx["table_number"]  — in-memory, set this session
-      2. user_sessions DB row      — persists across restarts/redeploys
-      3. Only if genuinely absent  — ask the user for table number
-
-    Math: Python sum() over price column floats — never an LLM.
-    The $8 + $4 = $13 hallucination bug is impossible here.
+    Python sum over price column — never an LLM.
+    Resolves table from memory → DB → asks user only if truly absent.
     """
     user      = update.effective_user
     user_ctx  = get_user_context(user.id, context)
+    table_num = user_ctx.get("table_number")
+    rest_id   = user_ctx.get("restaurant_id")
 
-    table_number  = user_ctx.get("table_number")
-    restaurant_id = user_ctx.get("restaurant_id")
-
-    # ── 1. Try DB session if not in memory ───────────────────────────────────
-    if not table_number:
+    if not table_num:
         try:
             sess = supabase.table("user_sessions") \
-                .select("table_number") \
-                .eq("user_id", str(user.id)) \
-                .execute()
+                .select("table_number").eq("user_id", str(user.id)).execute()
             if sess.data and sess.data[0].get("table_number"):
-                table_number = str(sess.data[0]["table_number"])
-                user_ctx["table_number"] = table_number    # cache in memory
+                table_num = str(sess.data[0]["table_number"])
+                user_ctx["table_number"] = table_num
         except Exception as e:
-            print(f"[BILL] Session lookup error: {e}")
+            print(f"[BILL] session error: {e}")
 
-    # ── 2. Still unknown — ask once ───────────────────────────────────────────
-    if not table_number:
+    if not table_num:
         set_user_state(user.id, UserState.AWAITING_TABLE, context)
         await update.message.reply_text(
-            "🪑 *What is your table number?*\n"
-            "_(I will pull up your bill right after!)_",
-            parse_mode="Markdown"
+            "🪑 What is your table number? _(I'll pull your bill right after!)_",
+            reply_markup=back_button(),
+            parse_mode="Markdown",
         )
         return
 
-    # ── 3. Fetch unpaid orders for this table ────────────────────────────────
     try:
         res = supabase.table("orders") \
-            .select("items, price") \
+            .select("id, items, price") \
             .eq("user_id", str(user.id)) \
-            .eq("restaurant_id", restaurant_id) \
-            .eq("table_number", str(table_number)) \
+            .eq("restaurant_id", rest_id) \
+            .eq("table_number", str(table_num)) \
             .neq("status", "paid") \
             .neq("status", "cancelled") \
             .execute()
 
         if not res.data:
             await update.message.reply_text(
-                f"🧾 *Table {table_number} — No active orders found.*",
-                parse_mode="Markdown"
+                f"🧾 *Table {table_num}* — No active orders found.",
+                parse_mode="Markdown",
+                reply_markup=back_button(),
             )
             return
 
-        # ── Python sum — deterministic, never an LLM ─────────────────────
-        total = round(sum(float(row["price"]) for row in res.data), 2)
-
-        lines = ["\n".join(
-            f"  • {row['items']}  —  ${float(row['price']):.2f}"
-            for row in res.data
-        )]
-        line_block = "\n".join(lines)
+        total = round(sum(float(r["price"]) for r in res.data), 2)
+        lines = "\n".join(
+            f"  • *#{r['id']}* {r['items']}  —  ${float(r['price']):.2f}"
+            for r in res.data
+        )
 
         await update.message.reply_text(
-            f"🧾 *Your Bill — Table {table_number}*\n\n"
-            f"{line_block}\n\n"
+            f"🧾 *Your Bill — Table {table_num}*\n\n"
+            f"{lines}\n\n"
             f"💰 *Total: ${total:.2f}*\n\n"
             f"_(Ask a waiter to process payment)_",
-            parse_mode="Markdown"
+            parse_mode="Markdown",
+            reply_markup=back_button(),
         )
 
     except Exception as e:
         print(f"[BILL ERROR] {e}")
         await update.message.reply_text(
-            "❌ Error fetching bill. Please ask staff for assistance."
+            "❌ Error fetching bill. Please ask staff.",
+            reply_markup=back_button(),
         )
 
 
 # ============================================================================
-# MAIN MESSAGE HANDLER (State Router)
+# GENERAL AI CHAT  (Dining mode only)
 # ============================================================================
-
-async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Main message router based on user state.
-
-    Priority order (top = highest):
-      1. Active booking flow  (AWAITING_GUESTS / AWAITING_TIME)
-      2. Active table entry   (AWAITING_TABLE)
-      3. Feedback state       (AWAITING_FEEDBACK) — checked before numbers cause issues
-      4. Passive table-number detection — catches "table 7" typed from any non-flow state
-      5. Menu keyword intercept — "show menu", "menu please" → structured list, not AI summary
-      6. Order processing — if table is known, attempt order parse first
-      7. General AI chat — fallback for everything else
-    """
-    user = update.effective_user
-    text = update.message.text.strip()
-    text_lower = text.lower()
-
-    # Get current state and context
-    user_state = get_user_state(user.id, context)
-    user_ctx   = get_user_context(user.id, context)
-
-    print(f"[MSG] User {user.id} state={user_state.value} table={user_ctx.get('table_number','—')}: '{text[:60]}'")
-
-    # ── 1. BOOKING FLOW STATES ───────────────────────────────────────────────
-    if user_state in [UserState.AWAITING_GUESTS, UserState.AWAITING_TIME]:
-        await handle_booking_flow(update, context, user_state)
-        return
-
-    # ── 2. TABLE ASSIGNMENT STATE ────────────────────────────────────────────
-    if user_state == UserState.AWAITING_TABLE:
-        await handle_table_assignment(update, context)
-        return
-
-    # ── 3. FEEDBACK STATE ────────────────────────────────────────────────────
-    # Must run before any numeric/order logic to avoid star ratings being
-    # misread as table numbers or order quantities.
-    if user_state == UserState.AWAITING_FEEDBACK:
-        await handle_feedback(update, context)
-        return
-
-    # ── 4. PASSIVE TABLE-NUMBER DETECTION ───────────────────────────────────
-    # Catches users who type "table 7" or "I'm at table 3" from IDLE state
-    # without going through the button / /table command flow.
-    # Pattern: message contains the word "table" followed (anywhere) by digits.
-    table_mention = re.search(r'\btable\s*(\d+)\b', text_lower)
-    if table_mention and not user_ctx.get("table_number"):
-        # Temporarily set state so handle_table_assignment runs correctly
-        set_user_state(user.id, UserState.AWAITING_TABLE, context)
-        await handle_table_assignment(update, context)
-        return
-
-    # ── 5. MENU KEYWORD INTERCEPT ────────────────────────────────────────────
-    # Catches "show menu", "view menu", "what's on the menu?", "menu please"
-    # Bypasses the AI fallback so users always get the real structured list.
-    menu_keywords = ["menu", "what do you serve", "what's available",
-                     "what do you have", "show me food", "food list"]
-    if any(kw in text_lower for kw in menu_keywords):
-        await _send_menu(update.message, user_ctx)
-        return
-
-    # ── 5b. BILLING KEYWORD INTERCEPT ────────────────────────────────────────
-    # Catches "bill please", "check please", "what's my total", "how much do I owe"
-    # Routed here BEFORE order processing so billing keywords don't accidentally
-    # trigger a food-order attempt.
-    bill_keywords = ["bill", "check please", "the check", "my total",
-                     "how much", "pay", "invoice", "receipt"]
-    if any(kw in text_lower for kw in bill_keywords):
-        await calculate_bill(update, context)
-        return
-
-    # ── 6. ORDER PROCESSING ──────────────────────────────────────────────────
-    # Only attempt if table number is known. process_order returns None when
-    # the message is not a food order, falling through to general chat below.
-    if user_ctx.get("table_number"):
-        order_result = await process_order(
-            text,
-            user,
-            user_ctx.get("restaurant_id"),
-            user_ctx.get("table_number"),
-            user_ctx.get("chat_id")
-        )
-        if order_result:
-            await update.message.reply_text(order_result)
-            return
-    else:
-        # No table set yet — if message looks order-like, prompt for table first
-        order_keywords = ["order", "i'll have", "i want", "can i get",
-                          "give me", "bring me", "i'd like"]
-        if any(kw in text_lower for kw in order_keywords):
-            set_user_state(user.id, UserState.AWAITING_TABLE, context)
-            await update.message.reply_text(
-                "🪑 *What's your table number?*\n"
-                "_(I'll place the order right after!)_",
-                parse_mode="Markdown"
-            )
-            return
-
-    # ── 7. GENERAL AI CHAT ───────────────────────────────────────────────────
-    await handle_general_chat(update, context)
-
 
 async def handle_general_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Handle general queries using AI when not in specific flow.
-    Always scoped to the user's current restaurant_id so that menu items
-    from other restaurants are never exposed.
-    """
-    user = update.effective_user
-    text = update.message.text.strip()
+    user     = update.effective_user
+    text     = update.message.text.strip()
     user_ctx = get_user_context(user.id, context)
-    restaurant_id = user_ctx.get("restaurant_id")
+    rest_id  = user_ctx.get("restaurant_id")
 
-    # Guard: restaurant_id must be set. Without this, the Supabase query has
-    # no restaurant filter and would return items from every restaurant.
-    if not restaurant_id:
+    if not rest_id:
         await update.message.reply_text(
-            "👋 Please use /start to begin.\n"
-            "That will connect you to the right restaurant."
+            "👋 Please use /start to begin.",
+            reply_markup=main_menu_keyboard(),
         )
         return
 
     try:
-        # Get menu context — always filtered to THIS restaurant only
-        menu_items = supabase.table("menu_items")\
-            .select("content")\
-            .eq("restaurant_id", restaurant_id)\
-            .limit(20)\
-            .execute()
-        
-        menu_context = "\n".join([m["content"] for m in menu_items.data]) if menu_items.data else "No menu available"
-        
-        # AI Response
-        prompt = f"""
-        You are a friendly restaurant AI assistant.
-        
-        Menu:
-        {menu_context}
-        
-        User Question: "{text}"
-        
-        Instructions:
-        - If asking about menu items, describe them warmly
-        - If asking about policies (parking, hours, etc.), be helpful
-        - If asking to order, politely say they need to provide table number first
-        - Keep responses concise (2-3 sentences max)
-        - Be friendly and professional
-        
-        Response:
-        """
-        
+        rows = supabase.table("menu_items") \
+            .select("content").eq("restaurant_id", rest_id).limit(20).execute()
+        menu_ctx = "\n".join(r["content"] for r in rows.data) if rows.data else "No menu available"
+
         completion = await groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
+            messages=[{"role": "user", "content": (
+                f"You are a friendly restaurant assistant.\n\n"
+                f"Menu:\n{menu_ctx}\n\n"
+                f"Customer: \"{text}\"\n\n"
+                f"Instructions:\n"
+                f"- Describe menu items warmly if asked\n"
+                f"- Answer restaurant policy questions helpfully\n"
+                f"- Keep response to 2-3 sentences\n"
+                f"- Be warm and professional\n\n"
+                f"Response:"
+            )}],
             temperature=0.7,
-            max_tokens=200
+            max_tokens=200,
         )
-        
-        response = completion.choices[0].message.content
-        await update.message.reply_text(response)
-        
+        await update.message.reply_text(
+            completion.choices[0].message.content,
+            reply_markup=back_button(),
+        )
     except Exception as e:
         print(f"[CHAT ERROR] {e}")
         await update.message.reply_text(
-            "I'm here to help! Try:\n"
-            "• /menu - View our menu\n"
-            "• /book - Make a reservation\n"
-            "• /table - Set your table number to order"
+            "I'm here to help! Try /menu to see what we're serving today.",
+            reply_markup=back_button(),
         )
 
 
 # ============================================================================
-# FASTAPI WEBHOOK ENDPOINT
+# MAIN MESSAGE HANDLER  (Mode-isolated router)
+# ============================================================================
+
+# Patterns used by the booking-attempt detector in Dining mode
+_DATE_PATTERN = re.compile(
+    r'\b(tomorrow|today|tonight|monday|tuesday|wednesday|thursday|friday|saturday|sunday'
+    r'|january|february|march|april|may|june|july|august|september|october|november|december'
+    r'|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec'
+    r'|next\s+week|this\s+weekend|\d{1,2}[/-]\d{1,2})\b',
+    re.IGNORECASE,
+)
+
+# Patterns used by the food-order detector in Booking mode
+_ORDER_PATTERN = re.compile(
+    r"\b(i('ll| will) have|i want|can i get|give me|bring me|i('d| would) like"
+    r"|order|burger|pizza|pasta|coffee|tea|juice|water|fries|salad|soup)\b",
+    re.IGNORECASE,
+)
+
+# Modification trigger keywords
+_MOD_KEYWORDS = ["remove", "take off", "drop the", "cancel", "without",
+                 "don't want", "no more", "delete", "modify order", "change order"]
+
+
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Mode-isolated message router.
+
+    Priority (top = highest):
+      1. AWAITING_ORDER_ID         — collect order number for mod/cancel
+      2. AWAITING_FEEDBACK         — collect ratings
+      3. Booking mode states       — AWAITING_GUESTS / AWAITING_TIME
+         └ cross-mode guard: food order attempt → redirect
+      4. AWAITING_TABLE            — table number input (digits only)
+      5. Dining mode (HAS_TABLE / IDLE with mode=DINING)
+         ├ cross-mode guard: date-like input → redirect
+         ├ modification/cancel trigger → ask for order ID
+         ├ menu keywords → structured menu
+         ├ bill keywords → bill
+         ├ order processing → process_order()
+         └ general chat → AI
+      6. No mode (IDLE at /start) → prompt to choose a mode
+    """
+    user       = update.effective_user
+    text       = update.message.text.strip()
+    text_lower = text.lower()
+
+    state    = get_user_state(user.id, context)
+    mode     = get_mode(user.id, context)
+    user_ctx = get_user_context(user.id, context)
+
+    print(f"[MSG] {user.id} mode={mode.value} state={state.value} "
+          f"table={user_ctx.get('table_number', '—')}: '{text[:60]}'")
+
+    # ── 1. ORDER ID COLLECTION ────────────────────────────────────────────────
+    if state == UserState.AWAITING_ORDER_ID:
+        await handle_order_id_input(update, context)
+        return
+
+    # ── 2. FEEDBACK ───────────────────────────────────────────────────────────
+    if state == UserState.AWAITING_FEEDBACK:
+        await handle_feedback(update, context)
+        return
+
+    # ── 3. BOOKING MODE ───────────────────────────────────────────────────────
+    if mode == Mode.BOOKING:
+        if state in [UserState.AWAITING_GUESTS, UserState.AWAITING_TIME]:
+            # Cross-mode guard: reject food orders inside booking flow
+            if _ORDER_PATTERN.search(text):
+                await update.message.reply_text(
+                    "📅 You're in *Booking Mode*.\n\n"
+                    "Please finish your reservation first, "
+                    "or press ⬅️ Main Menu to switch modes.",
+                    reply_markup=back_button(),
+                    parse_mode="Markdown",
+                )
+                return
+            await handle_booking_flow(update, context, state)
+            return
+        # Booking mode but unexpected state — re-prompt
+        set_user_state(user.id, UserState.AWAITING_GUESTS, context)
+        await update.message.reply_text(
+            "📅 *Booking Mode* — How many guests?",
+            reply_markup=back_button(),
+            parse_mode="Markdown",
+        )
+        return
+
+    # ── 4. TABLE NUMBER MODE (only digits) ────────────────────────────────────
+    if mode == Mode.TABLE or state == UserState.AWAITING_TABLE:
+        # Cross-mode guard inside TABLE mode: reject booking-date input
+        if mode == Mode.TABLE and _DATE_PATTERN.search(text) and not text.isdigit():
+            await update.message.reply_text(
+                "🪑 *Set Table Number* — please type only digits (e.g. '7').",
+                reply_markup=back_button(),
+                parse_mode="Markdown",
+            )
+            return
+        await handle_table_assignment(update, context)
+        return
+
+    # ── 5. DINING MODE (or passive table detection) ───────────────────────────
+    if mode == Mode.DINING or user_ctx.get("table_number"):
+
+        # Cross-mode guard: reject booking-date input in dining mode
+        if mode == Mode.DINING and _DATE_PATTERN.search(text):
+            # But allow "today's special" style — only block if also has a time hint
+            time_hint = re.search(r'\b(\d{1,2}(am|pm|:\d{2})|tonight|morning|evening|noon)\b',
+                                  text_lower)
+            if time_hint:
+                await update.message.reply_text(
+                    "🍽️ You're in *Dining Mode*.\n\n"
+                    "To make a reservation, press ⬅️ Main Menu and choose *Book a Table*.",
+                    reply_markup=back_button(),
+                    parse_mode="Markdown",
+                )
+                return
+
+        # Passive table detection (user typed "table 7" without pressing a button)
+        table_match = re.search(r'\btable\s*(\d+)\b', text_lower)
+        if table_match and not user_ctx.get("table_number"):
+            set_mode(user.id, Mode.DINING, context)
+            set_user_state(user.id, UserState.AWAITING_TABLE, context)
+            await handle_table_assignment(update, context)
+            return
+
+        # Modification / cancel trigger
+        mod_trigger = any(kw in text_lower for kw in _MOD_KEYWORDS)
+        order_id_in_text = re.search(r'#?(\d{3,})', text)   # order IDs tend to be ≥3 digits
+
+        if mod_trigger:
+            rest_id = user_ctx.get("restaurant_id")
+            # If they included an order ID in the same message, validate immediately
+            if order_id_in_text:
+                oid   = int(order_id_in_text.group(1))
+                order = fetch_order_for_user(oid, str(user.id), rest_id)
+                if order:
+                    is_cancel = any(p in text_lower for p in
+                                    ["cancel", "cancel order", "cancel everything",
+                                     "nevermind", "never mind"])
+                    if is_cancel:
+                        reply = stage_cancellation(order)
+                    else:
+                        reply = await stage_modification(order, text)
+                    await update.message.reply_text(
+                        reply, parse_mode="Markdown", reply_markup=back_button()
+                    )
+                    return
+                # ID given but doesn't match — fall through to ask
+            # No valid ID in message — ask for it
+            try:
+                recent = supabase.table("orders") \
+                    .select("id, items, price") \
+                    .eq("user_id", str(user.id)) \
+                    .eq("restaurant_id", rest_id) \
+                    .eq("status", "pending") \
+                    .order("created_at", desc=True) \
+                    .limit(5).execute()
+
+                if not recent.data:
+                    await update.message.reply_text(
+                        "❌ You have no active orders to modify.",
+                        reply_markup=back_button(),
+                    )
+                    return
+
+                order_list = "\n".join(
+                    f"  *#{o['id']}* — {o['items']}  (${float(o['price']):.2f})"
+                    for o in recent.data
+                )
+
+                is_cancel_intent = any(p in text_lower for p in
+                                       ["cancel", "nevermind", "never mind"])
+                action = "cancel" if is_cancel_intent else "modify"
+                user_ctx["pending_action"]   = action
+                user_ctx["pending_mod_text"] = text
+                set_user_state(user.id, UserState.AWAITING_ORDER_ID, context)
+
+                await update.message.reply_text(
+                    f"📋 *Your active orders:*\n{order_list}\n\n"
+                    f"Please type the *Order Number* you wish to {action}:",
+                    reply_markup=back_button(),
+                    parse_mode="Markdown",
+                )
+                return
+            except Exception as e:
+                print(f"[MOD TRIGGER ERROR] {e}")
+                await update.message.reply_text(
+                    "❌ Error fetching orders. Please try again.",
+                    reply_markup=back_button(),
+                )
+                return
+
+        # Menu keyword intercept
+        menu_kws = ["menu", "what do you serve", "what's available",
+                    "what do you have", "show me food", "food list"]
+        if any(kw in text_lower for kw in menu_kws):
+            await _send_menu(update.message, user_ctx)
+            return
+
+        # Bill keyword intercept
+        bill_kws = ["bill", "check please", "the check", "my total",
+                    "how much", "pay", "invoice", "receipt"]
+        if any(kw in text_lower for kw in bill_kws):
+            await calculate_bill(update, context)
+            return
+
+        # Order processing
+        if user_ctx.get("table_number"):
+            result = await process_order(
+                text, user,
+                user_ctx.get("restaurant_id"),
+                user_ctx.get("table_number"),
+                user_ctx.get("chat_id"),
+            )
+            if result:
+                reply_text, _order_id = result
+                await update.message.reply_text(
+                    reply_text,
+                    parse_mode="Markdown",
+                    reply_markup=back_button(),
+                )
+                return
+        else:
+            # Table not known yet and user looks like they want to order
+            order_kws = ["order", "i'll have", "i want", "can i get",
+                         "give me", "bring me", "i'd like"]
+            if any(kw in text_lower for kw in order_kws):
+                set_mode(user.id, Mode.DINING, context)
+                set_user_state(user.id, UserState.AWAITING_TABLE, context)
+                await update.message.reply_text(
+                    "🪑 *What's your table number?*\n"
+                    "_(I'll place the order right after!)_",
+                    reply_markup=back_button(),
+                    parse_mode="Markdown",
+                )
+                return
+
+        # General chat within dining mode
+        await handle_general_chat(update, context)
+        return
+
+    # ── 6. NO MODE — prompt to pick one ──────────────────────────────────────
+    user_ctx_name = user_ctx.get("restaurant_name", "Our Restaurant")
+    await update.message.reply_text(
+        f"👋 Welcome to *{user_ctx_name}*!\n\n"
+        f"Please choose an option from the menu to get started:",
+        reply_markup=main_menu_keyboard(),
+        parse_mode="Markdown",
+    )
+
+
+# ============================================================================
+# FASTAPI ENDPOINTS
 # ============================================================================
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
-    """
-    FastAPI endpoint to receive Telegram updates.
-    """
     try:
-        data = await request.json()
+        data   = await request.json()
         update = Update.de_json(data, telegram_app.bot)
         await telegram_app.process_update(update)
         return {"status": "ok"}
@@ -1028,54 +1157,43 @@ async def telegram_webhook(request: Request):
 
 @app.get("/")
 async def health_check():
-    """Health check endpoint"""
     return {
-        "status": "running",
-        "service": "Restaurant AI Concierge",
-        "timestamp": get_dubai_now().isoformat()
+        "status":    "running",
+        "service":   "Restaurant AI Concierge v4",
+        "timestamp": get_dubai_now().isoformat(),
     }
 
 
 # ============================================================================
-# APPLICATION STARTUP
+# STARTUP / SHUTDOWN
 # ============================================================================
 
 @app.on_event("startup")
 async def startup_event():
-    """
-    Initialize Telegram bot on FastAPI startup.
-    """
     global telegram_app
-    
-    # Build application
     telegram_app = Application.builder().token(TELEGRAM_TOKEN).build()
-    
-    # Register handlers
+
     telegram_app.add_handler(CommandHandler("start",  start_handler))
     telegram_app.add_handler(CommandHandler("help",   help_handler))
     telegram_app.add_handler(CommandHandler("menu",   menu_handler))
-    telegram_app.add_handler(CommandHandler("table",  table_command_handler))  # /table → AWAITING_TABLE
-    telegram_app.add_handler(CommandHandler("cancel", cancel_order_handler))
+    telegram_app.add_handler(CommandHandler("table",  table_command_handler))
+    telegram_app.add_handler(CommandHandler("cancel", cancel_command_handler))
     telegram_app.add_handler(CallbackQueryHandler(button_handler))
-    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
-    
-    # Initialize bot
+    telegram_app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler)
+    )
+
     await telegram_app.initialize()
     await telegram_app.start()
-    
-    print("✅ Telegram Bot Started Successfully")
+    print("✅ Telegram Bot v4 Started")
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """
-    Clean shutdown of Telegram bot.
-    """
     if telegram_app:
         await telegram_app.stop()
         await telegram_app.shutdown()
-    
-    print("🛑 Telegram Bot Stopped")
+    print("🛑 Bot stopped")
 
 
 if __name__ == "__main__":

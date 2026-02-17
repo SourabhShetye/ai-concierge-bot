@@ -1,22 +1,22 @@
 """
-Order Service  —  AI-Powered Order Processing  (v3)
-====================================================
-Changes from v2:
-  - calculate_price_from_items() matches only ($X) parenthesised prices to extract
-    ONLY values inside "($X)" parentheses, so quantity prefixes like "2x"
-    are never summed as prices.  (Fixes $8+$4=$13 hallucination.)
-  • process_new_order() ALWAYS recomputes total via Python — LLM total_price
-    is intentionally discarded.
-  • handle_modification() no longer commits changes immediately.
-    Instead it writes a pending_modification JSON blob and sets
-    modification_status='requested' for kitchen approval.
-  • Full-order cancellation still uses cancellation_status='requested'.
+Order Service  —  v4
+=====================
+Changes from v3:
+  • process_new_order() captures the Supabase-generated order ID from the
+    INSERT response and returns it so main.py can display "Order #123".
+  • handle_modification() now accepts an explicit validated order_id instead
+    of blindly grabbing the "latest" order. Ownership is verified by main.py
+    before calling this function.
+  • stage_cancellation() is a new thin helper for the /cancel flow — also
+    accepts an explicit validated order_id.
+  • calculate_price_from_items() unchanged (deterministic, no LLM).
+  • extract_json_from_text() unchanged.
 """
 
 import json
 import os
 import re
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 
 from supabase import create_client
 from groq import AsyncGroq
@@ -62,97 +62,105 @@ def extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
 
 def calculate_price_from_items(items_str: str) -> float:
     """
-    Sum prices deterministically from a string like:
+    Sum prices from a string like:
         "Full Stack Burger ($18), 2x Binary Bites ($16), Java Jolt ($4)"
 
-    Only matches values wrapped in literal ($X) so that quantity prefixes
-    such as '2x' are never mistaken for prices.
-
-    Pure Python — guaranteed accuracy.
+    Only matches values inside ($...) parentheses — quantity prefixes like
+    "2x" are structurally excluded from the match.
     """
-    # Primary pattern: values inside ($...)
     prices = re.findall(r'\(\$(\d+(?:\.\d+)?)\)', items_str)
     if prices:
         return round(sum(float(p) for p in prices), 2)
-
-    # Fallback: bare dollar signs e.g. "$18"
     bare = re.findall(r'\$(\d+(?:\.\d+)?)', items_str)
     if bare:
         return round(sum(float(p) for p in bare), 2)
-
     return 0.0
 
 
 # ============================================================================
-# MODIFICATION REQUEST  (staged for kitchen approval)
+# ORDER OWNERSHIP LOOKUP  (used by main.py before any modification)
 # ============================================================================
 
-async def handle_modification(
-    user_text:     str,
-    user,
-    restaurant_id: str,
-) -> Optional[str]:
+def fetch_order_for_user(order_id: int, user_id: str, restaurant_id: str) -> Optional[Dict]:
     """
-    Detect item-removal/modification requests and STAGE them for kitchen
-    approval rather than committing immediately.
+    Fetch a specific order and verify it belongs to this user at this restaurant.
+    Returns the order dict if valid, None if not found or not owned by this user.
 
-    Workflow:
-      1. Find user's most recent pending order.
-      2. Use LLM to determine remaining_items / removed_items.
-      3. Compute new_price in Python (deterministic).
-      4. Write pending_modification JSON + set modification_status='requested'.
-      5. Kitchen approves or rejects in admin.py KDS tab.
-
-    Full-order cancellation uses the existing cancellation_status pathway.
-
-    Returns user-facing string, or None if message is not a mod request.
+    Called by main.py BEFORE invoking stage_modification() or stage_cancellation()
+    so that every modification path is validated explicitly.
     """
-    mod_keywords = ["cancel", "remove", "delete", "take off", "no more",
-                    "don't want", "drop the", "without"]
-    if not any(kw in user_text.lower() for kw in mod_keywords):
+    try:
+        res = supabase.table("orders") \
+            .select("*") \
+            .eq("id", order_id) \
+            .eq("user_id", str(user_id)) \
+            .eq("restaurant_id", str(restaurant_id)) \
+            .eq("status", "pending") \
+            .execute()
+        return res.data[0] if res.data else None
+    except Exception as e:
+        print(f"[FETCH ORDER ERROR] {e}")
         return None
 
+
+# ============================================================================
+# STAGE CANCELLATION  (explicit order ID — no blind "latest" lookup)
+# ============================================================================
+
+def stage_cancellation(order: Dict) -> str:
+    """
+    Mark a validated order for cancellation review by kitchen.
+    The order dict must already be validated by fetch_order_for_user().
+
+    Returns a user-facing confirmation string.
+    """
     try:
-        res = supabase.table("orders")\
-            .select("*")\
-            .eq("user_id", str(user.id))\
-            .eq("restaurant_id", restaurant_id)\
-            .eq("status", "pending")\
-            .neq("cancellation_status", "requested")\
-            .order("created_at", desc=True)\
-            .limit(1)\
+        supabase.table("orders") \
+            .update({"cancellation_status": "requested"}) \
+            .eq("id", order["id"]) \
             .execute()
+        return (
+            f"📩 *Cancellation Requested*\n"
+            f"Order *#{order['id']}* — _{order['items']}_\n\n"
+            f"Kitchen will review shortly and notify you."
+        )
+    except Exception as e:
+        print(f"[STAGE CANCEL ERROR] {e}")
+        return "❌ Error requesting cancellation. Please ask staff."
 
-        if not res.data:
-            return "❌ No active orders to modify."
 
-        order = res.data[0]
+# ============================================================================
+# STAGE MODIFICATION  (explicit order ID — no blind "latest" lookup)
+# ============================================================================
 
-        # Already has a pending modification? Don't stack another.
-        if order.get("modification_status") == "requested":
-            return (
-                "⏳ You already have a pending modification request.\n"
-                "Please wait for kitchen to respond before making another."
-            )
+async def stage_modification(order: Dict, user_text: str) -> str:
+    """
+    Stage a partial item-removal request for kitchen approval.
+    The order dict must already be validated by fetch_order_for_user().
 
-        # Full-order cancellation?
-        full_cancel = [
-            "cancel order", "cancel my order", "cancel the order",
-            "cancel everything", "nevermind", "never mind"
-        ]
-        if any(phrase in user_text.lower() for phrase in full_cancel):
-            supabase.table("orders")\
-                .update({"cancellation_status": "requested"})\
-                .eq("id", order["id"])\
-                .execute()
-            return (
-                f"📩 *Cancellation Requested* for Order #{order['id']}\n"
-                f"Items: _{order['items']}_\n"
-                f"Kitchen will review shortly."
-            )
+    Uses LLM to parse what to remove, then writes a pending_modification
+    blob — does NOT commit items/price changes until kitchen approves.
 
-        # Partial modification — ask LLM what to remove
-        prompt = f"""
+    Returns a user-facing confirmation string.
+    """
+    order_id = order["id"]
+
+    # Guard: don't stack a second modification on top of a pending one
+    if order.get("modification_status") == "requested":
+        return (
+            f"⏳ Order *#{order_id}* already has a pending modification.\n"
+            f"Please wait for kitchen to respond before making another change."
+        )
+
+    # Full-cancel phrases inside a mod flow
+    full_cancel = [
+        "cancel order", "cancel my order", "cancel the order",
+        "cancel everything", "nevermind", "never mind"
+    ]
+    if any(phrase in user_text.lower() for phrase in full_cancel):
+        return stage_cancellation(order)
+
+    prompt = f"""
 Current Order: {order['items']}
 User Request: "{user_text}"
 
@@ -168,6 +176,7 @@ Rules:
 - all_removed: true only if every item is removed
 - If request is unclear, keep the original order unchanged
 """
+    try:
         completion = await groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
@@ -179,55 +188,49 @@ Rules:
             max_tokens=200,
         )
         data = extract_json_from_text(completion.choices[0].message.content)
+    except Exception as e:
+        print(f"[MOD LLM ERROR] {e}")
+        return "❌ Error processing modification. Please try again."
 
-        if not data:
-            return "❌ Couldn't parse your request. Please describe it differently."
+    if not data:
+        return "❌ Couldn't understand your request. Please describe what to remove."
 
-        # All items removed → escalate to full cancellation
-        if data.get("all_removed") or not data.get("remaining_items", "").strip():
-            supabase.table("orders")\
-                .update({"cancellation_status": "requested"})\
-                .eq("id", order["id"])\
-                .execute()
-            return (
-                f"📩 *Cancellation Requested* for Order #{order['id']}\n"
-                f"Kitchen will confirm shortly."
-            )
+    if data.get("all_removed") or not data.get("remaining_items", "").strip():
+        return stage_cancellation(order)
 
-        remaining = data["remaining_items"].strip()
-        removed   = data.get("removed_items", "item(s)").strip()
-        new_price = calculate_price_from_items(remaining)   # Python, not LLM
+    remaining = data["remaining_items"].strip()
+    removed   = data.get("removed_items", "item(s)").strip()
+    new_price = calculate_price_from_items(remaining)
 
-        # Stage the modification — do NOT update items/price yet
-        pending_blob = json.dumps({
-            "remaining_items": remaining,
-            "removed_items":   removed,
-            "new_price":       new_price,
-        })
+    pending_blob = json.dumps({
+        "remaining_items": remaining,
+        "removed_items":   removed,
+        "new_price":       new_price,
+    })
 
-        supabase.table("orders")\
+    try:
+        supabase.table("orders") \
             .update({
                 "modification_status":  "requested",
                 "pending_modification": pending_blob,
-            })\
-            .eq("id", order["id"])\
+            }) \
+            .eq("id", order_id) \
             .execute()
-
-        return (
-            f"📩 *Modification Requested*\n"
-            f"Remove: _{removed}_\n"
-            f"Remaining if approved: {remaining}\n"
-            f"New total if approved: *${new_price:.2f}*\n\n"
-            f"Kitchen is reviewing — you'll be notified shortly."
-        )
-
     except Exception as e:
-        print(f"[MODIFICATION ERROR] {e}")
-        return "❌ Error submitting modification. Please try /cancel or ask staff."
+        print(f"[STAGE MOD ERROR] {e}")
+        return "❌ Error staging modification. Please ask staff."
+
+    return (
+        f"📩 *Modification Requested for Order #{order_id}*\n\n"
+        f"Remove: _{removed}_\n"
+        f"Remaining if approved: {remaining}\n"
+        f"New total if approved: *${new_price:.2f}*\n\n"
+        f"Kitchen is reviewing — you'll be notified shortly. ⏳"
+    )
 
 
 # ============================================================================
-# NEW ORDER PROCESSING
+# NEW ORDER PROCESSING  (returns order_id for display)
 # ============================================================================
 
 async def process_new_order(
@@ -236,19 +239,22 @@ async def process_new_order(
     restaurant_id: str,
     table_number:  str,
     chat_id:       str,
-) -> Optional[str]:
+) -> Optional[Tuple[str, int]]:
     """
     Parse a natural-language order against the live menu_items table.
 
+    Returns (reply_string, order_id) on success, or None if not a food order.
+
     Price is ALWAYS computed by calculate_price_from_items() — the LLM's
     total_price field is intentionally discarded to prevent hallucinated sums.
+    The generated order_id is captured from the INSERT response so main.py
+    can display "✅ Order #123 Confirmed" to the user.
     """
     try:
-        # Always fetch live menu from DB (not a static file)
-        menu_rows = supabase.table("menu_items")\
-            .select("content")\
-            .eq("restaurant_id", restaurant_id)\
-            .limit(80)\
+        menu_rows = supabase.table("menu_items") \
+            .select("content") \
+            .eq("restaurant_id", restaurant_id) \
+            .limit(80) \
             .execute()
 
         menu_text = (
@@ -272,10 +278,10 @@ Is this a FOOD ORDER or a QUESTION/CHAT? Return JSON only:
 
 RULES:
 - "valid": false if user is asking a question, NOT ordering
-- Only list items from the menu
+- Only list items from the menu above
 - Format every item as: ItemName ($price)
-- For multiples: Nx ItemName ($price_x_quantity)  e.g. 2x Binary Bites at $8 = ($16)
-- Do NOT include a total_price field (we calculate it ourselves)
+- For multiples: Nx ItemName ($price_x_quantity) e.g. 2x Binary Bites at $8 each = ($16)
+- Do NOT include a total_price field (calculated by Python)
 """
         completion = await groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
@@ -289,11 +295,7 @@ RULES:
         )
         data = extract_json_from_text(completion.choices[0].message.content)
 
-        if not data:
-            print("[ORDER] Failed to parse AI response")
-            return None
-
-        if not data.get("valid"):
+        if not data or not data.get("valid"):
             print("[ORDER] Not a valid order request")
             return None
 
@@ -303,9 +305,8 @@ RULES:
             return None
 
         items_str   = ", ".join(items)
-        total_price = calculate_price_from_items(items_str)  # deterministic
+        total_price = calculate_price_from_items(items_str)
 
-        # Edge case: AI forgot parentheses — try bare $ amounts
         if total_price <= 0:
             bare = re.findall(r'\$(\d+(?:\.\d+)?)', items_str)
             total_price = round(sum(float(p) for p in bare), 2) if bare else 0.0
@@ -324,15 +325,18 @@ RULES:
             "pending_modification": None,
         }
 
-        supabase.table("orders").insert(order_row).execute()
+        result    = supabase.table("orders").insert(order_row).execute()
+        order_id  = result.data[0]["id"]   # capture DB-generated ID
 
-        return (
-            f"👨‍🍳 *Order Sent to Kitchen!*\n\n"
+        reply = (
+            f"👨\u200d🍳 *Order #{order_id} Confirmed!*\n\n"
             f"🍽 {items_str}\n"
             f"💰 Total: *${total_price:.2f}*\n"
             f"🪑 Table: {table_number}\n\n"
-            f"We'll notify you when it's ready! 🔔"
+            f"We'll notify you when it's ready! 🔔\n"
+            f"_To modify, say \"modify order #{order_id}\" or \"/cancel\"_"
         )
+        return reply, order_id
 
     except Exception as e:
         import traceback
@@ -342,7 +346,7 @@ RULES:
 
 
 # ============================================================================
-# MAIN ENTRY POINT
+# MAIN ENTRY POINT  (called by main.py for new orders only)
 # ============================================================================
 
 async def process_order(
@@ -351,18 +355,15 @@ async def process_order(
     restaurant_id: str,
     table_number:  str,
     chat_id:       str,
-) -> Optional[str]:
+) -> Optional[Tuple[str, int]]:
     """
-    Called by main.py message_handler.
+    Entry point for new food order processing only.
 
-    1. Modification/cancellation request → stage for kitchen approval
-    2. New food order                    → insert with deterministic price
-    3. Neither                           → return None (main.py falls to chat)
+    Modification and cancellation are now handled explicitly in main.py
+    via the AWAITING_ORDER_ID state — they are NOT routed through here.
+
+    Returns (reply_string, order_id) on success, or None if not an order.
     """
-    mod = await handle_modification(user_text, user, restaurant_id)
-    if mod:
-        return mod
-
     return await process_new_order(
         user_text, user, restaurant_id, table_number, chat_id
     )
