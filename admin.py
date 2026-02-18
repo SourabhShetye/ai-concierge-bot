@@ -14,7 +14,7 @@ def to_dubai(utc_dt):
     if utc_dt.tzinfo is None: utc_dt = utc_dt.replace(tzinfo=timezone.utc)
     return utc_dt.astimezone(DUBAI_TZ)
 
-st.set_page_config(title="Admin v6", layout="wide", page_icon="👨‍🍳")
+st.set_page_config(page_title="Admin v6", layout="wide", page_icon="👨‍🍳")
 st_autorefresh(interval=5000, key="g_refresh")
 load_dotenv()
 
