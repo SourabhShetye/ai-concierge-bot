@@ -231,7 +231,31 @@ def check_granular_availability(rid: str, booking_time: datetime, party_size: in
             return True, f"seats available ({', '.join(used)})"
         return False, "not enough tables for that party size"
     except Exception as ex:
-        print(f"[AVAIL] {ex}"); return False, "availability check error"
+        print(f"[AVAIL] {ex}")
+        # Fallback: if no inventory defined, use simple count<10 check
+        try:
+            res = supabase.table("bookings") \
+                .select("id", count="exact") \
+                .eq("restaurant_id", rid) \
+                .eq("booking_time", booking_time.strftime("%Y-%m-%d %H:%M:%S%z")) \
+                .neq("status", "cancelled") \
+                .execute()
+            available = (res.count or 0) < 10
+            return (available, "Available" if available else "Fully booked (simple check)")
+        except Exception:
+            return (False, f"Availability check error: {ex}")
+    # Fallback: if no inventory defined, use simple count<10 check
+        try:
+            res = supabase.table("bookings") \
+                .select("id", count="exact") \
+                .eq("restaurant_id", rid) \
+                .eq("booking_time", booking_time.strftime("%Y-%m-%d %H:%M:%S%z")) \
+                .neq("status", "cancelled") \
+                .execute()
+            available = (res.count or 0) < 10
+            return (available, "Available" if available else "Fully booked (simple check)")
+        except Exception:
+            return (False, f"Availability check error: {ex}")
 
 def check_duplicate_booking(uid, rid, booking_time):
     try:
@@ -789,13 +813,31 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uc = get_user_context(user.id, context)
     print(f"[MSG] {user.id} mode={mode.value} state={state.value}: '{text[:60]}'")
 
-    if state == UserState.AWAITING_NAME:              await handle_name_input(update, context);        return
-    if state == UserState.AWAITING_BOOKING_CANCEL_ID: await handle_booking_cancel_id(update, context); return
-    if state == UserState.AWAITING_BOOKING_MOD_ID:    await handle_booking_mod_id(update, context);    return
-    if state == UserState.AWAITING_BOOKING_MOD_TIME:  await handle_booking_mod_time(update, context);  return
-    if state == UserState.AWAITING_ORDER_ID:          await handle_order_id_input(update, context);    return
-    if state == UserState.AWAITING_FEEDBACK:          await handle_feedback(update, context);          return
+# CRITICAL: AWAITING_FEEDBACK must be checked FIRST
+# Otherwise numbers like "5,4,5" get parsed as food order
+    if state == UserState.AWAITING_FEEDBACK:
+        await handle_feedback(update, context)
+        return
 
+    if state == UserState.AWAITING_NAME:
+        await handle_name_input(update, context)
+        return
+
+    if state == UserState.AWAITING_BOOKING_CANCEL_ID:
+        await handle_booking_cancel_id(update, context)
+        return
+
+    if state == UserState.AWAITING_BOOKING_MOD_ID:
+        await handle_booking_mod_id(update, context)
+        return
+
+    if state == UserState.AWAITING_BOOKING_MOD_TIME:
+        await handle_booking_mod_time(update, context)
+        return
+
+    if state == UserState.AWAITING_ORDER_ID:
+        await handle_order_id_input(update, context)
+        return
     if mode == Mode.BOOKING:
         if state in [UserState.AWAITING_GUESTS, UserState.AWAITING_TIME]:
             if _ORDER_KWS.search(text):

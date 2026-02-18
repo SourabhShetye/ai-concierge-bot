@@ -1,14 +1,9 @@
 """
-Restaurant Admin Dashboard — Streamlit  v6
-===========================================
-New in v6:
-  • Tab 6 "👥 Customer Insights" — CRM table with tags, spend, visit count,
-    churn risk, and preferences; filterable by tag; summary metrics.
-  • Tab 7 "🪑 Table Inventory" — View and edit tables_inventory per restaurant.
-  • "Close Table" button now calls order_service.update_crm_on_payment()
-    for every unique user in the closing set, so CRM stats stay current.
-  • Sidebar: restaurant creation + ID display unchanged from v5.
-  • Tabs 1-5 (Bookings, KDS, Live Tables, Menu Manager, Policies) unchanged.
+Restaurant Admin Dashboard — Streamlit  v6 (FIXED)
+====================================================
+Fixes applied:
+  • Tab 7: table_count → quantity (column name fix)
+  • Autorefresh: 10s global, 10s KDS
 """
 
 import json, re, os
@@ -21,7 +16,6 @@ from streamlit_autorefresh import st_autorefresh
 from dotenv import load_dotenv
 from supabase import create_client
 
-# Import CRM payment updater (order_service must be on PYTHONPATH)
 import sys
 sys.path.insert(0, os.path.dirname(__file__))
 from order_service import update_crm_on_payment
@@ -32,19 +26,15 @@ def to_dubai(utc_dt):
     if utc_dt.tzinfo is None: utc_dt = utc_dt.replace(tzinfo=timezone.utc)
     return utc_dt.astimezone(DUBAI_TZ)
 
-# ── Page config ────────────────────────────────────────────────────────────────
-
 st.set_page_config(page_title="Restaurant Admin", layout="wide",
                    page_icon="👨‍🍳", initial_sidebar_state="expanded")
-st_autorefresh(interval=5000, key="global_refresh")
+st_autorefresh(interval=10000, key="global_refresh")
 load_dotenv()
 
 try:
     supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 except Exception as ex:
     st.error(f"❌ DB error: {ex}"); st.stop()
-
-# ── Helpers ────────────────────────────────────────────────────────────────────
 
 def send_telegram(chat_id, text):
     token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -88,8 +78,6 @@ def parse_menu_content(content):
             if line.startswith(f+":"): r[f] = line.replace(f+":","").strip()
     return r
 
-# ── Sidebar ────────────────────────────────────────────────────────────────────
-
 st.sidebar.title("🏢 Restaurant Manager")
 _ADD = "➕ Add New Restaurant"
 try:
@@ -126,8 +114,6 @@ st.sidebar.code(cur_rid, language=None)
 st.sidebar.caption(f"Bot: `/start rest_id={cur_rid}`")
 st.sidebar.info(f"🔄 {get_ts()}")
 
-# ── Tabs ───────────────────────────────────────────────────────────────────────
-
 st.title(f"📊 Dashboard: {sel_name}")
 st.markdown("---")
 
@@ -136,8 +122,6 @@ tab1,tab2,tab3,tab4,tab5,tab6,tab7 = st.tabs([
     "🍽️ Menu Manager","ℹ️ Policies & Settings",
     "👥 Customer Insights","🪑 Table Inventory",
 ])
-
-# ── TAB 1: Bookings ────────────────────────────────────────────────────────────
 
 with tab1:
     st.header("📅 Reservations & Bookings")
@@ -182,11 +166,9 @@ with tab1:
         else: st.info("📭 No bookings")
     except Exception as ex: st.error(f"{ex}")
 
-# ── TAB 2: Kitchen Display ─────────────────────────────────────────────────────
-
 with tab2:
     st.header("🔥 Kitchen Display System")
-    st_autorefresh(interval=3000, key="kds_refresh")
+    st_autorefresh(interval=10000, key="kds_refresh")
     try:
         orders = supabase.table("orders").select("*").eq("restaurant_id",cur_rid)\
             .eq("status","pending").order("created_at").execute().data
@@ -266,11 +248,9 @@ with tab2:
         else: st.success("🎉 Kitchen clear!")
     except Exception as ex: st.error(f"{ex}")
 
-# ── TAB 3: Live Tables ─────────────────────────────────────────────────────────
-
 with tab3:
     st.header("💰 Live Tables & Billing")
-    st.caption("Fresh from DB on every 5-second refresh. Approved mods appear instantly.")
+    st.caption("Fresh from DB on every 10-second refresh.")
     if st.button("🔄 Refresh Now"): st.rerun()
     st.markdown("---")
     try:
@@ -303,8 +283,6 @@ with tab3:
                         try:
                             for oid in data["order_ids"]:
                                 supabase.table("orders").update({"status":"paid"}).eq("id",oid).execute()
-                            # CRM: update each unique user's spend and visit count
-                            # Compute per-user spend from this close
                             user_spend: dict = {}
                             for o in data["orders"]:
                                 uid = o.get("user_id","")
@@ -319,8 +297,6 @@ with tab3:
                         except Exception as ex: st.error(f"{ex}")
         else: st.info("📭 No active tables")
     except Exception as ex: st.error(f"{ex}")
-
-# ── TAB 4: Menu Manager ────────────────────────────────────────────────────────
 
 with tab4:
     st.header("🍽️ Menu Manager")
@@ -393,11 +369,9 @@ with tab4:
             if done: st.success(f"✅ {done} imported"); st.rerun()
             if fail: st.error(f"❌ {fail} failed")
 
-# ── TAB 5: Policies ────────────────────────────────────────────────────────────
-
 with tab5:
     st.header("ℹ️ Policies & AI Context")
-    st.caption("Injected into AI system prompt in General Mode. Changes take effect immediately.")
+    st.caption("Injected into AI system prompt. Changes take effect immediately.")
     st.markdown("---")
     existing = ""; pol_id = None
     try:
@@ -409,7 +383,7 @@ with tab5:
     with col_main:
         st.subheader(f"📝 {sel_name} — Policy Text")
         draft = st.text_area("Restaurant info & policies:", value=existing, height=350,
-            placeholder="WiFi: TechBites2025\nParking: Free on-site\nHours: 8am–11pm\nWheelchair: Yes\nVegan: Yes",
+            placeholder="WiFi: TechBites2025\nParking: Free\nHours: 8am–11pm\nWheelchair: Yes",
             key="policy_editor")
         sv,cl = st.columns([3,1])
         with sv:
@@ -434,11 +408,9 @@ with tab5:
         with st.expander("🔍 Preview AI Injection"):
             st.code(f"RESTAURANT INFO:\n{existing}", language=None)
 
-# ── TAB 6: Customer Insights (NEW) ────────────────────────────────────────────
-
 with tab6:
     st.header("👥 Customer Insights")
-    st.caption("CRM data — tags computed live from visit_count, total_spend, and last_visit.")
+    st.caption("CRM data — tags computed live from visit_count, total_spend, last_visit.")
     st.markdown("---")
 
     tag_filter = st.selectbox("Filter by tag:",
@@ -453,18 +425,15 @@ with tab6:
     except Exception as ex:
         st.error(f"Error loading users: {ex}"); all_users = []
 
-    # Attach computed tags to each user row
     enriched = []
     for u in all_users:
         tags = compute_tags(u)
         enriched.append({**u, "tags": tags})
 
-    # Summary metrics
     total_users  = len(enriched)
     churn_count  = sum(1 for u in enriched if "Churn Risk" in u["tags"])
     vip_count    = sum(1 for u in enriched if "VIP" in u["tags"])
-    avg_spend    = (sum(float(u.get("total_spend") or 0) for u in enriched) / total_users
-                   ) if total_users else 0
+    avg_spend    = (sum(float(u.get("total_spend") or 0) for u in enriched) / total_users) if total_users else 0
 
     m1,m2,m3,m4 = st.columns(4)
     m1.metric("👤 Total Customers", total_users)
@@ -473,7 +442,6 @@ with tab6:
     m4.metric("💰 Avg Spend",        fmt(avg_spend))
     st.markdown("---")
 
-    # Apply filter
     if tag_filter == "All":
         display = enriched
     elif tag_filter == "New / No Data":
@@ -495,7 +463,6 @@ with tab6:
             name      = u.get("full_name") or u.get("username") or "Unknown"
             username  = u.get("username","")
 
-            # Compute days since last visit
             days_since = None
             if lv:
                 try:
@@ -523,32 +490,27 @@ with tab6:
                     detail_cols[2].info(f"📋 Preferences: _{prefs}_")
 
     st.markdown("---")
-    # Export hint
-    st.caption("Tip: Use Supabase's built-in CSV export on the `users` table for a full data dump.")
-
-# ── TAB 7: Table Inventory (NEW) ───────────────────────────────────────────────
+    st.caption("Tip: Use Supabase CSV export on users table for full data dump.")
 
 with tab7:
     st.header("🪑 Table Inventory")
-    st.caption("Define your physical table stock per restaurant. Used by the Smart Availability algorithm.")
+    st.caption("Define physical table stock. Used by Smart Availability algorithm.")
     st.markdown("---")
 
     try:
-        inv_data = supabase.table("tables_inventory").select("id,capacity,table_count") \
+        inv_data = supabase.table("tables_inventory").select("id,capacity,quantity") \
             .eq("restaurant_id", cur_rid).order("capacity").execute().data or []
     except Exception as ex:
         st.error(f"Error loading inventory: {ex}"); inv_data = []
 
-    # Summary
     if inv_data:
-        total_tables = sum(r["table_count"] for r in inv_data)
-        total_seats  = sum(r["capacity"] * r["table_count"] for r in inv_data)
+        total_tables = sum(r["quantity"] for r in inv_data)
+        total_seats  = sum(r["capacity"] * r["quantity"] for r in inv_data)
         ic1, ic2 = st.columns(2)
         ic1.metric("Total Tables", total_tables)
         ic2.metric("Total Seats",  total_seats)
         st.markdown("---")
 
-    # Current inventory table
     st.subheader("Current Inventory")
     if not inv_data:
         st.info("No inventory configured yet. Add table types below.")
@@ -556,8 +518,8 @@ with tab7:
         for row in inv_data:
             c1,c2,c3,c4 = st.columns([2,2,2,1])
             c1.write(f"**{row['capacity']}-seater tables**")
-            c2.write(f"Count: **{row['table_count']}**")
-            c3.write(f"Seats: **{row['capacity'] * row['table_count']}**")
+            c2.write(f"Count: **{row['quantity']}**")
+            c3.write(f"Seats: **{row['capacity'] * row['quantity']}**")
             if c4.button("🗑️", key=f"inv_del_{row['id']}", use_container_width=True):
                 try:
                     supabase.table("tables_inventory").delete().eq("id", row["id"]).execute()
@@ -565,34 +527,30 @@ with tab7:
                 except Exception as ex: st.error(f"{ex}")
         st.markdown("---")
 
-    # Add / update table type
     st.subheader("➕ Add / Update Table Type")
-    st.caption("If a table type with this capacity already exists, its count will be updated.")
+    st.caption("If capacity exists, count will be updated.")
     with st.form("add_inv", clear_on_submit=True):
         ai1, ai2 = st.columns(2)
         new_cap   = ai1.number_input("Capacity (seats per table)", min_value=1, max_value=20, value=4, step=1)
-        new_count = ai2.number_input("Number of tables of this type", min_value=1, max_value=50, value=3, step=1)
+        new_count = ai2.number_input("Number of tables", min_value=1, max_value=50, value=3, step=1)
         if st.form_submit_button("💾 Save", type="primary", use_container_width=True):
             try:
                 supabase.table("tables_inventory").upsert({
                     "restaurant_id": cur_rid,
                     "capacity":      int(new_cap),
-                    "table_count":   int(new_count),
+                    "quantity":      int(new_count),
                 }, on_conflict="restaurant_id,capacity").execute()
                 st.success(f"✅ Saved: {int(new_count)}x {int(new_cap)}-seater tables"); st.rerun()
             except Exception as ex: st.error(f"Error: {ex}")
 
-    # Algorithm preview
     if inv_data:
         with st.expander("🔍 Inventory Preview"):
             st.caption("How the bot's Smart Availability algorithm sees your tables:")
             preview_lines = []
             for row in inv_data:
-                preview_lines.append(f"  {row['table_count']}x {row['capacity']}-seater")
+                preview_lines.append(f"  {row['quantity']}x {row['capacity']}-seater")
             st.code("\n".join(preview_lines), language=None)
-            st.caption("Party sizing example: a party of 6 could use one 4-top + one 2-top, or three 2-tops.")
-
-# ── Footer ─────────────────────────────────────────────────────────────────────
+            st.caption("Party sizing example: 6 guests could use one 4-top + one 2-top, or three 2-tops.")
 
 st.markdown("---")
 st.caption(f"🔄 Auto-refresh active • {get_ts()}")

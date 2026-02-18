@@ -44,11 +44,23 @@ def extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
 # ── Deterministic price calculation ───────────────────────────────────────────
 
 def calculate_price_from_items(items_str: str) -> float:
+    """
+    Sum prices from items string, handling both:
+      - Single items: "ItemName ($18)"
+      - Quantity items: "2x ItemName ($32)"  where $32 is ALREADY total for 2
+    
+    The LLM formats multiples as "Nx Item ($total_for_N)" so we just sum.
+    """
+    # Match all ($X) prices in parentheses
     prices = re.findall(r'\(\$(\d+(?:\.\d+)?)\)', items_str)
-    if prices: return round(sum(float(p) for p in prices), 2)
-    bare = re.findall(r'\$(\d+(?:\.\d+)?)', items_str)
-    if bare: return round(sum(float(p) for p in bare), 2)
-    return 0.0
+    total = round(sum(float(p) for p in prices), 2)
+    
+    # Fallback: if no parentheses found, try bare $X
+    if total == 0:
+        bare = re.findall(r'\$(\d+(?:\.\d+)?)', items_str)
+        total = round(sum(float(p) for p in bare), 2)
+    
+    return total
 
 
 # ── CRM: update on payment ─────────────────────────────────────────────────────
@@ -117,9 +129,21 @@ async def stage_modification(order: Dict, user_text: str) -> str:
     if order.get("modification_status") == "requested":
         return (f"⏳ Order *#{order_id}* already has a pending modification.\n"
                 f"Please wait for kitchen before making another change.")
-    full_cancel = ["cancel order","cancel my order","cancel the order","cancel everything","nevermind","never mind"]
-    if any(p in user_text.lower() for p in full_cancel):
+    # FIXED: Stricter cancel detection + reject additions
+    full_cancel = ["cancel order","cancel my order","cancel the order","cancel everything","cancel it","nevermind","never mind"]
+    text_lower = user_text.lower().strip()
+
+    # Only trigger if EXACT match or at start of phrase
+    if any(text_lower == phrase or text_lower.startswith(phrase + " ") for phrase in full_cancel):
         return stage_cancellation(order)
+
+    # FIXED: Reject addition attempts
+    if any(word in text_lower for word in ["add", "adding", "include", "also give me", "more", "extra", "another"]):
+        return (
+            "⚠️ *Modifications can only REMOVE items.*\n\n"
+            "To add items, please place a new order.\n\n"
+            "_Example removal: 'remove the fries from order #42'_"
+        )
     prompt = f"""
 Current Order: {order['items']}
 User Request: "{user_text}"
@@ -196,7 +220,13 @@ Return JSON only:
 RULES:
 - "valid": false if user is asking a question, NOT ordering
 - Only list items from the menu
-- Format: ItemName ($price), multiples: Nx ItemName ($total_price)
+- Format each item as: ItemName ($price)
+- For multiples: Nx ItemName ($TOTAL_PRICE_FOR_ALL_N)
+  CRITICAL EXAMPLES:
+  * 1x Carbonara at $32 each = "Carbonara ($32)"
+  * 2x Carbonara at $32 each = "2x Carbonara ($64)"  ← $32 × 2 = $64
+  * 3x Fries at $7 each = "3x Fries ($21)"  ← $7 × 3 = $21
+  The price in parentheses must be the TOTAL for that line item!
 - Do NOT include total_price field
 """
         c = await groq_client.chat.completions.create(
