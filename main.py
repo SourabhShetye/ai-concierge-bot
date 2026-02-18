@@ -205,6 +205,12 @@ def check_granular_availability(rid: str, booking_time: datetime, party_size: in
         available: Dict[int,int] = {r["capacity"]:r["table_count"] for r in inv.data}
         sizes = sorted(available.keys())
 
+        # CRITICAL FIX: Check if party size exceeds total capacity
+        total_seats = sum(cap * qty for cap, qty in available.items())
+        if party_size > total_seats:
+            return (False, f"party of {party_size} exceeds total capacity ({total_seats} seats)")
+
+
         # Deduct tables already booked at this slot
         bk = supabase.table("bookings").select("party_size")\
             .eq("restaurant_id",rid)\
