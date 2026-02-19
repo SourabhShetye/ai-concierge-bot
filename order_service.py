@@ -147,9 +147,20 @@ async def stage_modification(order: Dict, user_text: str) -> str:
     prompt = f"""
 Current Order: {order['items']}
 User Request: "{user_text}"
+
 Return JSON only:
 {{"remaining_items":"Full Stack Burger ($18), Java Jolt ($4)","removed_items":"Binary Bites ($8)","all_removed":false}}
-Rules: keep prices in ($X), all_removed true only if everything removed.
+
+CRITICAL RULES:
+1. If removing quantity from multi-item:
+   Example: Order is "2x Carbonara ($32)" and user says "remove 1 carbonara"
+   Result: {{"remaining_items":"1x Carbonara ($16)","removed_items":"1x Carbonara ($16)","all_removed":false}}
+   
+2. Calculate per-item price: If original is "2x Item ($32)", per-item = $32/2 = $16
+3. Remaining quantity gets: remaining_qty × per_item_price
+4. Format: "Nx Item ($TOTAL)" where $TOTAL is the sum for that quantity
+5. all_removed = true ONLY if nothing remains
+6. Keep all prices in parentheses: ($X)
 """
     try:
         c = await groq_client.chat.completions.create(
@@ -163,9 +174,27 @@ Rules: keep prices in ($X), all_removed true only if everything removed.
     if not data: return "❌ Couldn't understand. Describe what to remove."
     if data.get("all_removed") or not data.get("remaining_items","").strip():
         return stage_cancellation(order)
+    
     remaining = data["remaining_items"].strip()
     removed   = data.get("removed_items","item(s)").strip()
     new_price = calculate_price_from_items(remaining)
+    old_price = float(order.get("price", 0))
+    
+    # CRITICAL VALIDATION: New price cannot exceed old price
+    if new_price > old_price:
+        return (
+            f"❌ *Calculation Error*\n\n"
+            f"The modification would make the order MORE expensive (${new_price:.2f} > ${old_price:.2f}).\n\n"
+            f"Please try rephrasing your request or contact staff."
+        )
+    
+    # Additional sanity check: If removing items, price should decrease
+    if new_price == old_price:
+        return (
+            f"⚠️ *No Change Detected*\n\n"
+            f"The order price remains ${old_price:.2f}.\n\n"
+            f"Please specify which items to remove more clearly."
+        )
     blob = json.dumps({"remaining_items":remaining,"removed_items":removed,"new_price":new_price})
     try:
         supabase.table("orders").update({"modification_status":"requested","pending_modification":blob})\

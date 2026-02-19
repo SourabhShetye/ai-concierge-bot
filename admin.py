@@ -303,12 +303,44 @@ with tab3:
                                             }).execute()
                                         except Exception as ex:
                                             print(f"[FEEDBACK STATE] {ex}")
+                            # Track spending by user_id AND session_id
                             user_spend: dict = {}
+                            session_spend: dict = {}
+                            
                             for o in data["orders"]:
-                                uid = o.get("user_id","")
-                                if uid: user_spend[uid] = user_spend.get(uid,0.0) + float(o["price"])
+                                uid = o.get("user_id", "")
+                                sid = o.get("session_id", "")
+                                
+                                if uid: 
+                                    user_spend[uid] = user_spend.get(uid, 0.0) + float(o["price"])
+                                if sid:
+                                    session_spend[sid] = session_spend.get(sid, 0.0) + float(o["price"])
+                            
+                            # Update users table (legacy)
                             for uid, amt in user_spend.items():
                                 if uid: update_crm_on_payment(uid, amt)
+                            
+                            # Update user_sessions table (new session-based tracking)
+                            for sid, amt in session_spend.items():
+                                if sid:
+                                    try:
+                                        # Get current session stats
+                                        sess_res = supabase.table("user_sessions").select("visit_count,total_spend")\
+                                            .eq("session_id", sid).limit(1).execute()
+                                        
+                                        if sess_res.data:
+                                            old_visits = int(sess_res.data[0].get("visit_count", 0))
+                                            old_spend = float(sess_res.data[0].get("total_spend", 0.0))
+                                            
+                                            supabase.table("user_sessions").update({
+                                                "visit_count": old_visits + 1,
+                                                "total_spend": round(old_spend + amt, 2),
+                                                "last_visit": datetime.now(timezone.utc).isoformat()
+                                            }).eq("session_id", sid).execute()
+                                            
+                                            print(f"[SESSION CRM] sid={sid[:8]} visits={old_visits+1} spend=${old_spend+amt:.2f}")
+                                    except Exception as ex:
+                                        print(f"[SESSION CRM ERROR] {ex}")
                             dishes = "\n".join(f"• {d}" for d in sorted(data["dish_names"]))
                             fb_msg = (f"✅ *Payment Received!*\n\n💰 Total: {fmt(data['total'])}\n\n"
                                       f"⭐ *Please rate (1-5):*\n\n{dishes}\n\nReply: 5,4,5 _(per dish+overall)_")
@@ -430,7 +462,7 @@ with tab5:
 
 with tab6:
     st.header("👥 Customer Insights")
-    st.caption("CRM data — tags computed live from visit_count, total_spend, last_visit.")
+    st.caption("CRM data from sessions — each session represents a customer visit.")
     st.markdown("---")
 
     tag_filter = st.selectbox("Filter by tag:",
@@ -438,50 +470,68 @@ with tab6:
         key="tag_filter")
 
     try:
-        users_res = supabase.table("users").select(
-            "id,username,full_name,visit_count,total_spend,last_visit,preferences"
+        # FIXED: Query user_sessions instead of users to get session-specific names
+        sessions_res = supabase.table("user_sessions").select(
+            "session_id,user_id,display_name,visit_count,total_spend,last_visit,created_at"
         ).execute()
-        all_users = users_res.data or []
+        all_sessions = sessions_res.data or []
     except Exception as ex:
-        st.error(f"Error loading users: {ex}"); all_users = []
+        st.error(f"Error loading sessions: {ex}"); all_sessions = []
 
+    # Compute tags for each session
     enriched = []
-    for u in all_users:
-        tags = compute_tags(u)
-        enriched.append({**u, "tags": tags})
+    for s in all_sessions:
+        tags = []
+        vc = int(s.get("visit_count") or 0)
+        ts = float(s.get("total_spend") or 0.0)
+        lv = s.get("last_visit")
+        
+        if vc > 5:  tags.append("Frequent Diner")
+        if ts > 500: tags.append("Big Spender")
+        if "Frequent Diner" in tags and "Big Spender" in tags: tags.append("VIP")
+        if lv and vc > 0:
+            try:
+                lv_dt = datetime.fromisoformat(str(lv).replace("Z","+00:00"))
+                if (datetime.now(timezone.utc) - lv_dt) > timedelta(days=30):
+                    tags.append("Churn Risk")
+            except Exception: pass
+        
+        enriched.append({**s, "tags": tags})
 
-    total_users  = len(enriched)
-    churn_count  = sum(1 for u in enriched if "Churn Risk" in u["tags"])
-    vip_count    = sum(1 for u in enriched if "VIP" in u["tags"])
-    avg_spend    = (sum(float(u.get("total_spend") or 0) for u in enriched) / total_users) if total_users else 0
+    total_customers = len(enriched)
+    churn_count     = sum(1 for s in enriched if "Churn Risk" in s["tags"])
+    vip_count       = sum(1 for s in enriched if "VIP" in s["tags"])
+    avg_spend       = (sum(float(s.get("total_spend") or 0) for s in enriched) / total_customers) if total_customers else 0
 
     m1,m2,m3,m4 = st.columns(4)
-    m1.metric("👤 Total Customers", total_users)
-    m2.metric("👑 VIP Guests",       vip_count)
-    m3.metric("⚠️ Churn Risk",       churn_count)
-    m4.metric("💰 Avg Spend",        fmt(avg_spend))
+    m1.metric("👤 Total Sessions", total_customers)
+    m2.metric("👑 VIP Guests",     vip_count)
+    m3.metric("⚠️ Churn Risk",     churn_count)
+    m4.metric("💰 Avg Spend",      fmt(avg_spend))
     st.markdown("---")
 
+    # Apply filter
     if tag_filter == "All":
         display = enriched
     elif tag_filter == "New / No Data":
-        display = [u for u in enriched if not u["tags"] and int(u.get("visit_count") or 0) == 0]
+        display = [s for s in enriched if not s["tags"] and int(s.get("visit_count") or 0) == 0]
     else:
-        display = [u for u in enriched if tag_filter in u["tags"]]
+        display = [s for s in enriched if tag_filter in s["tags"]]
 
-    st.write(f"**Showing {len(display)} customer(s)**")
+    st.write(f"**Showing {len(display)} session(s)**")
 
     if not display:
-        st.info("No customers match this filter.")
+        st.info("No sessions match this filter.")
     else:
-        for u in display:
-            tags      = u["tags"]
-            vc        = int(u.get("visit_count") or 0)
-            ts        = float(u.get("total_spend") or 0.0)
-            lv        = u.get("last_visit")
-            prefs     = u.get("preferences") or ""
-            name      = u.get("full_name") or u.get("username") or "Unknown"
-            username  = u.get("username","")
+        for s in display:
+            tags         = s["tags"]
+            vc           = int(s.get("visit_count") or 0)
+            ts           = float(s.get("total_spend") or 0.0)
+            lv           = s.get("last_visit")
+            name         = s.get("display_name") or "Guest"
+            session_id   = s.get("session_id", "")
+            user_id      = s.get("user_id", "")
+            created_at   = s.get("created_at")
 
             days_since = None
             if lv:
@@ -496,21 +546,28 @@ with tab6:
 
             with st.container(border=True):
                 h1, h2, h3 = st.columns([3, 2, 2])
-                h1.markdown(f"{risk_icon} **{name}** (@{username})")
+                h1.markdown(f"{risk_icon} **{name}**")
                 h1.markdown(tag_badges)
-                h2.metric("Visits",  vc)
+                h2.metric("Visits",      vc)
                 h3.metric("Total Spend", fmt(ts))
 
                 detail_cols = st.columns([2, 2, 3])
                 detail_cols[0].caption(
                     f"Last visit: {f'{days_since}d ago' if days_since is not None else 'Never'}"
                 )
-                detail_cols[1].caption(f"User ID: `{u['id'][:12]}...`")
-                if prefs:
-                    detail_cols[2].info(f"📋 Preferences: _{prefs}_")
+                
+                # Show session creation time
+                try:
+                    created_dt = datetime.fromisoformat(str(created_at).replace("Z","+00:00"))
+                    created_str = to_dubai(created_dt).strftime("%b %d, %I:%M %p")
+                    detail_cols[1].caption(f"First seen: {created_str}")
+                except Exception:
+                    detail_cols[1].caption(f"Session: {session_id[:8]}...")
+                
+                detail_cols[2].caption(f"Telegram User: `{user_id[:12]}...`")
 
     st.markdown("---")
-    st.caption("Tip: Use Supabase CSV export on users table for full data dump.")
+    st.caption("💡 Each session represents a unique customer conversation (name entered at /start).")
 
 with tab7:
     st.header("🪑 Table Inventory")
