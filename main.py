@@ -236,15 +236,26 @@ def check_granular_availability(rid: str, booking_time: datetime, party_size: in
             return (True, f"available ({table_desc})")
         else:
             # Failed - see what's already taken
+            # Failed - calculate what's actually remaining
+            used_tables = {}
             already_allocated = allocate_tables(total_inventory.copy(), [b["party_size"] for b in existing_bookings])
+            
             if already_allocated:
-                # Show remaining capacity
-                remaining = total_inventory.copy()
-                for booking_tables in already_allocated:
-                    for cap, qty in booking_tables.items():
-                        remaining[cap] = remaining.get(cap, 0) - qty
+                # Calculate tables used by existing bookings
+                for booking_allocation in already_allocated:
+                    for cap, qty in booking_allocation.items():
+                        used_tables[cap] = used_tables.get(cap, 0) + qty
+                
+                # Calculate truly remaining tables
+                remaining = {}
+                for cap, total_qty in total_inventory.items():
+                    remaining[cap] = total_qty - used_tables.get(cap, 0)
+                
                 remaining_seats = sum(cap * qty for cap, qty in remaining.items())
-                return (False, f"insufficient tables (only {remaining_seats} seats remain, but party needs {party_size})")
+                
+                # Show detailed breakdown
+                remaining_desc = ", ".join(f"{qty}x{cap}-seat" for cap, qty in sorted(remaining.items()) if qty > 0)
+                return (False, f"insufficient tables ({remaining_seats} seats remain: {remaining_desc}, but party needs {party_size})")
             else:
                 return (False, "no available tables for this party size")
                 
@@ -478,10 +489,76 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=back_button(), parse_mode="Markdown")
     elif data == "mode_booking":
         set_mode(user.id, Mode.BOOKING, context)
+        # NEW: Ask if user wants to book or cancel
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📅 Make a Booking", callback_data="booking_new")],
+            [InlineKeyboardButton("❌ Cancel a Booking", callback_data="booking_cancel")],
+            [InlineKeyboardButton("⬅️ Main Menu", callback_data="main_menu")],
+        ])
+        await query.message.reply_text(
+            "📅 *Booking Management*\n\nWhat would you like to do?",
+            reply_markup=keyboard, parse_mode="Markdown"
+        )
+    elif data == "booking_new":
         set_user_state(user.id, UserState.AWAITING_GUESTS, context)
         await query.message.reply_text(
-            "📅 *Booking Mode*\n\nHow many guests? _(e.g. '4' or 'party of 6')_",
-            reply_markup=back_button(), parse_mode="Markdown")
+            "📅 *New Booking*\n\nHow many guests? _(e.g. '4' or 'party of 6')_",
+            reply_markup=back_button(), parse_mode="Markdown"
+        )
+    
+    elif data == "booking_cancel":
+        # Redirect to existing cancel booking flow
+        await cancel_booking_command_interactive(update, context)
+        
+    elif data.startswith("cancel_booking_"):
+        # Extract booking ID from callback data
+        bid = int(data.replace("cancel_booking_", ""))
+        uc = get_user_context(user.id, context)
+        
+        try:
+            # Fetch the booking
+            res = supabase.table("bookings").select("*")\
+                .eq("id", bid)\
+                .eq("session_id", uc.get("session_id", ""))\
+                .eq("restaurant_id", uc.get("restaurant_id"))\
+                .eq("status", "confirmed").execute()
+            
+            if not res.data:
+                await query.message.reply_text(
+                    f"❌ Booking *#{bid}* not found or already cancelled.",
+                    reply_markup=back_button(), parse_mode="Markdown"
+                )
+                return
+            
+            bk = res.data[0]
+            bt = datetime.fromisoformat(bk["booking_time"].replace("Z", "+00:00"))
+            hours_until = (bt - datetime.now(timezone.utc)).total_seconds() / 3600
+            
+            # Verify 4-hour requirement
+            if hours_until < 4:
+                await query.message.reply_text(
+                    f"⚠️ *Cancellation Not Allowed*\n\n"
+                    f"Your reservation is only *{max(0, hours_until):.1f} hours* away.\n\n"
+                    f"Cancellations require *4+ hours notice*. Please call the restaurant.",
+                    reply_markup=back_button(), parse_mode="Markdown"
+                )
+                return
+            
+            # Cancel the booking
+            supabase.table("bookings").update({"status": "cancelled"}).eq("id", bid).execute()
+            
+            bts = bt.astimezone(DUBAI_TZ).strftime("%B %d at %I:%M %p")
+            await query.message.reply_text(
+                f"✅ *Booking #{bid} Cancelled*\n\n"
+                f"{bk['party_size']} guests on {bts}.\n\n"
+                f"To make a new booking, use the button below.",
+                reply_markup=main_menu_keyboard(), parse_mode="Markdown"
+            )
+            
+        except Exception as ex:
+            print(f"[CANCEL CALLBACK] {ex}")
+            await query.message.reply_text("❌ Error cancelling booking.", reply_markup=back_button())
+        
     elif data == "menu":
         await _send_menu(query.message, uc)
 
@@ -551,6 +628,19 @@ async def handle_booking_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
         if not bt:
             await update.message.reply_text("❌ Invalid/past time. Try 'tomorrow 8pm'.",
                 reply_markup=back_button(), parse_mode="Markdown"); return
+        
+        # NEW: Check 2-hour advance booking requirement
+        hours_until = (bt - datetime.now(timezone.utc)).total_seconds() / 3600
+        if hours_until < 2:
+            await update.message.reply_text(
+                f"⚠️ *Advance Booking Required*\n\n"
+                f"Bookings must be made at least *2 hours in advance*.\n\n"
+                f"Your requested time is only *{max(0, hours_until):.1f} hours* away.\n\n"
+                f"Please choose a later time or call the restaurant for immediate seating.",
+                reply_markup=back_button(), parse_mode="Markdown"
+            )
+            return
+        
         rid = uc.get("restaurant_id"); party = uc.get("party_size",1)
         
         can_seat, reason = check_granular_availability(rid, bt, party)
@@ -604,8 +694,9 @@ async def cancel_booking_command(update: Update, context: ContextTypes.DEFAULT_T
     user = update.effective_user; uc = get_user_context(user.id, context)
     try:
         bks = supabase.table("bookings").select("id,party_size,booking_time")\
-            .eq("user_id",str(user.id)).eq("restaurant_id",uc.get("restaurant_id"))\
-            .eq("status","confirmed").order("booking_time").execute()
+            .eq("session_id", uc.get("session_id", ""))\
+            .eq("restaurant_id", uc.get("restaurant_id"))\
+            .eq("status", "confirmed").order("booking_time").execute()
         if not bks.data:
             await update.message.reply_text("❌ No active bookings.",reply_markup=back_button()); return
         lines = []
@@ -621,6 +712,71 @@ async def cancel_booking_command(update: Update, context: ContextTypes.DEFAULT_T
             reply_markup=back_button(), parse_mode="Markdown")
     except Exception as ex:
         print(f"[CANBK] {ex}"); await update.message.reply_text("❌ Error fetching bookings.")
+        
+async def cancel_booking_command_interactive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Interactive booking cancellation from button menu (not /command)."""
+    query = update.callback_query if hasattr(update, 'callback_query') and update.callback_query else None
+    user = update.effective_user
+    uc = get_user_context(user.id, context)
+    
+    try:
+        # Fetch bookings for THIS SESSION
+        bks = supabase.table("bookings").select("id,party_size,booking_time")\
+            .eq("session_id", uc.get("session_id", ""))\
+            .eq("restaurant_id", uc.get("restaurant_id"))\
+            .eq("status", "confirmed").order("booking_time").execute()
+        
+        if not bks.data:
+            msg = "❌ No active bookings for this session."
+            if query:
+                await query.message.reply_text(msg, reply_markup=back_button())
+            else:
+                await update.message.reply_text(msg, reply_markup=back_button())
+            return
+        
+        # Build booking list with cancel buttons
+        lines = ["📋 *Your Active Bookings:*\n"]
+        keyboard_buttons = []
+        
+        for b in bks.data:
+            try:
+                bt = datetime.fromisoformat(b["booking_time"].replace("Z", "+00:00"))
+                bts = bt.astimezone(DUBAI_TZ).strftime("%b %d at %I:%M %p")
+                hours_until = (bt - datetime.now(timezone.utc)).total_seconds() / 3600
+                
+                # Check if cancellable
+                if hours_until >= 4:
+                    status = "✅ Cancellable"
+                    keyboard_buttons.append([
+                        InlineKeyboardButton(
+                            f"❌ Cancel #{b['id']} - {b['party_size']} guests, {bts}",
+                            callback_data=f"cancel_booking_{b['id']}"
+                        )
+                    ])
+                else:
+                    status = f"🔒 Too soon ({hours_until:.1f}h away)"
+                
+                lines.append(f"  *#{b['id']}* — {b['party_size']} guests, {bts}\n  {status}")
+            except Exception:
+                lines.append(f"  *#{b['id']}* — {b['party_size']} guests")
+        
+        keyboard_buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="mode_booking")])
+        keyboard = InlineKeyboardMarkup(keyboard_buttons)
+        
+        msg = "\n\n".join(lines) + "\n\n💡 *Note:* Bookings can only be cancelled 4+ hours in advance."
+        
+        if query:
+            await query.message.reply_text(msg, reply_markup=keyboard, parse_mode="Markdown")
+        else:
+            await update.message.reply_text(msg, reply_markup=keyboard, parse_mode="Markdown")
+            
+    except Exception as ex:
+        print(f"[CANCEL INTERACTIVE] {ex}")
+        msg = "❌ Error fetching bookings."
+        if query:
+            await query.message.reply_text(msg, reply_markup=back_button())
+        else:
+            await update.message.reply_text(msg, reply_markup=back_button())
 
 async def handle_booking_cancel_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user; text = update.message.text.strip()
