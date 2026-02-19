@@ -6,6 +6,10 @@ Fixes applied:
   • Autorefresh: 10s global, 10s KDS
 """
 
+# At the very top after other imports
+import requests
+from telegram import Bot
+
 import json, re, os
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -282,7 +286,23 @@ with tab3:
                     if st.button("💳 Close Table & Payment",key=f"pay_{tn}",use_container_width=True,type="primary"):
                         try:
                             for oid in data["order_ids"]:
-                                supabase.table("orders").update({"status":"paid"}).eq("id",oid).execute()
+                                supabase.table("orders").update({"status":"paid"}).eq("id",oid).execute()   
+                            # CRITICAL FIX: Set user state to AWAITING_FEEDBACK in user_sessions
+                            # Extract unique user IDs from this table's orders
+                            user_ids = list(data["user_ids"])
+                            if user_ids:
+                                # For simplicity, if multiple users at one table, set state for all
+                                # In practice, usually one user per table in the bot
+                                for uid in user_ids:
+                                    if uid:
+                                        try:
+                                            # Store feedback state in user_sessions table
+                                            supabase.table("user_sessions").upsert({
+                                                "user_id": str(uid),
+                                                "awaiting_feedback": True
+                                            }).execute()
+                                        except Exception as ex:
+                                            print(f"[FEEDBACK STATE] {ex}")
                             user_spend: dict = {}
                             for o in data["orders"]:
                                 uid = o.get("user_id","")

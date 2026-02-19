@@ -264,6 +264,7 @@ def check_granular_availability(rid: str, booking_time: datetime, party_size: in
             return (False, f"Availability check error: {ex}")
 
 def check_duplicate_booking(uid, rid, booking_time):
+    """Check if THIS user already has a booking at this exact time."""
     try:
         res = supabase.table("bookings").select("id")\
             .eq("user_id",str(uid)).eq("restaurant_id",rid)\
@@ -272,7 +273,6 @@ def check_duplicate_booking(uid, rid, booking_time):
         return bool(res.data)
     except Exception as ex:
         print(f"[DUP] {ex}"); return False
-
 
 # ── /start — hard reset + name handshake ──────────────────────────────────────
 
@@ -437,13 +437,16 @@ async def handle_booking_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text("❌ Invalid/past time. Try 'tomorrow 8pm'.",
                 reply_markup=back_button(), parse_mode="Markdown"); return
         rid = uc.get("restaurant_id"); party = uc.get("party_size",1)
-        if check_duplicate_booking(user.id, rid, bt):
-            await update.message.reply_text("❌ You already have a booking at that time.",reply_markup=back_button())
-            clear_user_state(user.id, context); return
+        
         can_seat, reason = check_granular_availability(rid, bt, party)
         if not can_seat:
             await update.message.reply_text(f"❌ {reason}.\n\nPlease try a different time.",
                 reply_markup=back_button()); return
+        
+        if check_duplicate_booking(user.id, rid, bt):
+            await update.message.reply_text("❌ You already have a booking at that time.",reply_markup=back_button())
+            clear_user_state(user.id, context); return
+        
         try:
             supabase.table("bookings").insert({
                 "restaurant_id":rid,"user_id":str(user.id),
@@ -596,15 +599,51 @@ async def handle_booking_mod_time(update: Update, context: ContextTypes.DEFAULT_
 
 async def handle_table_assignment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user; text = update.message.text.strip()
-    uc = get_user_context(user.id, context)
+    uc   = get_user_context(user.id, context)
+    rid  = uc.get("restaurant_id")
     nums = re.findall(r'\d+', text)
-    if not nums: await update.message.reply_text("❌ Type the table number (e.g. '7').",reply_markup=back_button()); return
-    tnum = nums[0]; uc["table_number"] = tnum
-    try: supabase.table("user_sessions").upsert({"user_id":str(user.id),"table_number":tnum}).execute()
-    except Exception as ex: print(f"[TABLE] {ex}")
+    if not nums: 
+        await update.message.reply_text("❌ Type the table number (e.g. '7').",reply_markup=back_button())
+        return
+    
+    tnum = nums[0]
+    
+    # CRITICAL FIX: Check if this table is already in use by another customer
+    try:
+        # Check if there are active orders at this table from OTHER users
+        existing = supabase.table("orders").select("user_id,customer_name")\
+            .eq("restaurant_id", rid)\
+            .eq("table_number", str(tnum))\
+            .neq("status", "paid").neq("status", "cancelled")\
+            .execute()
+        
+        # Filter out orders from THIS user (they can reuse their own table)
+        other_users = [o for o in (existing.data or []) if o["user_id"] != str(user.id)]
+        
+        if other_users:
+            other_name = other_users[0].get("customer_name", "another customer")
+            await update.message.reply_text(
+                f"⚠️ *Table {tnum} is currently in use* by {other_name}.\n\n"
+                f"Please verify your table number and try again.",
+                reply_markup=back_button(), parse_mode="Markdown"
+            )
+            return
+    except Exception as ex:
+        print(f"[TABLE CHECK] {ex}")
+        # If check fails, allow it (better than blocking legitimate customers)
+    
+    # Table is available - assign it
+    uc["table_number"] = tnum
+    try: 
+        supabase.table("user_sessions").upsert({"user_id":str(user.id),"table_number":tnum}).execute()
+    except Exception as ex: 
+        print(f"[TABLE] {ex}")
+    
     set_user_state(user.id, UserState.HAS_TABLE, context)
-    await update.message.reply_text(f"✅ *Table {tnum} set!*\n\nWhat would you like to order?\n_Example: '2 Binary Bites and a Java Jolt'_",
-        reply_markup=back_button(), parse_mode="Markdown")
+    await update.message.reply_text(
+        f"✅ *Table {tnum} set!*\n\nWhat would you like to order?\n_Example: '2 Binary Bites and a Java Jolt'_",
+        reply_markup=back_button(), parse_mode="Markdown"
+    )
 
 
 # ── Order ID handler ───────────────────────────────────────────────────────────
@@ -645,17 +684,29 @@ async def cancel_command_handler(update: Update, context: ContextTypes.DEFAULT_T
 # ── Feedback ───────────────────────────────────────────────────────────────────
 
 async def handle_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user; text = update.message.text.strip()
-    uc = get_user_context(user.id, context)
-    ratings = re.findall(r'\b[1-5]\b', text)
-    if not ratings: await update.message.reply_text("Please provide ratings (1-5)."); return
+    user = update.effective_user
+    text = update.message.text.strip()
+    uc   = get_user_context(user.id, context)
+    
+    # Accept ANY text as feedback - don't validate format
+    # This prevents edge cases where validation fails and state isn't cleared
     try:
-        supabase.table("feedback").insert({"restaurant_id":uc.get("restaurant_id"),
-            "user_id":str(user.id),"ratings":text,"created_at":get_dubai_now().isoformat()}).execute()
-        await update.message.reply_text("⭐ Thank you for your feedback!",reply_markup=main_menu_keyboard())
+        supabase.table("feedback").insert({
+            "restaurant_id": uc.get("restaurant_id"),
+            "user_id": str(user.id),
+            "ratings": text,
+            "created_at": get_dubai_now().isoformat(),
+        }).execute()
+        
+        await update.message.reply_text(
+            "⭐ Thank you for your feedback!\n\nSee you again soon! 😊",
+            reply_markup=main_menu_keyboard()
+        )
         reset_to_general(user.id, context)
     except Exception as ex:
-        print(f"[FB] {ex}"); await update.message.reply_text("✅ Feedback received.")
+        print(f"[FB] {ex}")
+        # Even on error, clear the state to prevent being stuck
+        await update.message.reply_text("✅ Feedback received. Thank you!")
         reset_to_general(user.id, context)
 
 
@@ -814,8 +865,10 @@ async def handle_order_mode_chat(update: Update, context: ContextTypes.DEFAULT_T
 # ── Main message router ────────────────────────────────────────────────────────
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user; text = update.message.text.strip()
-    state = get_user_state(user.id, context); mode = get_mode(user.id, context)
+    user = update.effective_user; 
+    text = update.message.text.strip()
+    state = get_user_state(user.id, context); 
+    mode = get_mode(user.id, context)
     uc = get_user_context(user.id, context)
     print(f"[MSG] {user.id} mode={mode.value} state={state.value}: '{text[:60]}'")
 
@@ -824,10 +877,28 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if state == UserState.AWAITING_FEEDBACK:
         await handle_feedback(update, context)
         return
+    # ALSO check if user_sessions says awaiting_feedback (set by admin panel)
+    try:
+        sess = supabase.table("user_sessions").select("awaiting_feedback")\
+            .eq("user_id", str(user.id)).limit(1).execute()
+        if sess.data and sess.data[0].get("awaiting_feedback"):
+            # User was marked as awaiting feedback by payment system
+            set_user_state(user.id, UserState.AWAITING_FEEDBACK, context)
+            # Clear the flag
+            supabase.table("user_sessions").update({"awaiting_feedback": False})\
+                .eq("user_id", str(user.id)).execute()
+            # Now handle the feedback
+            await handle_feedback(update, context)
+            return
+    except Exception as ex:
+        print(f"[SESS CHECK] {ex}")
 
     if state == UserState.AWAITING_NAME:
         await handle_name_input(update, context)
         return
+
+    # NOW compute text_lower for other handlers
+    text_lower = text.lower()
 
     if state == UserState.AWAITING_BOOKING_CANCEL_ID:
         await handle_booking_cancel_id(update, context)
