@@ -215,19 +215,30 @@ async def process_new_order(
             )
 
         prompt = f"""You are a restaurant order assistant.
+
 MENU:
 {menu_text}
+
 USER REQUEST: "{user_text}"
 {pref_instruction}
+
 Return JSON only:
 {{
   "valid": true,
   "items": ["Full Stack Burger ($18)", "2x Binary Bites ($16)"],
   "allergy_warning": null
 }}
-RULES:
+
+CRITICAL RULES:
 - "valid": false if user is asking a question, NOT ordering
-- Only list items from the menu
+- Use FUZZY MATCHING for menu items - users make typos:
+  * "404 fizz" → "404 Fizz Not Found"
+  * "carbonara" → "C++ Carbonara"
+  * "fries" → "Firewall Fries"
+  * "burger" → "Full Stack Burger"
+- If user says a quantity WITHOUT item name, match to closest menu item:
+  * "2 of 404" → "2x 404 Fizz Not Found"
+- Only list items from the menu above (but be flexible with naming)
 - Format each item as: ItemName ($price)
 - For multiples: Nx ItemName ($TOTAL_PRICE_FOR_ALL_N)
   CRITICAL EXAMPLES:

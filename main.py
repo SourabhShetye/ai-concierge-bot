@@ -11,7 +11,7 @@ New in v6:
   4. CUSTOMER CRM — load_crm_profile() computes tags; personalised
      greetings; allergy detection & warnings; VIP comp offers.
 """
-
+from typing import Optional, Dict, Any, List, Tuple  # Make sure List is imported
 import os, re, json, random
 from datetime import datetime, timezone, timedelta
 from enum import Enum
@@ -188,80 +188,120 @@ async def parse_booking_time(user_input: str) -> Optional[datetime]:
 
 def check_granular_availability(rid: str, booking_time: datetime, party_size: int) -> Tuple[bool,str]:
     """
-    Bin-packing algorithm using tables_inventory table.
-    Falls back to count<10 if no inventory configured.
+    Smart table allocation using bin-packing.
+    Returns (can_seat, message) where message explains which tables would be used.
     """
     try:
-        inv = supabase.table("tables_inventory").select("capacity,table_count")\
+        # 1. Load inventory
+        inv = supabase.table("tables_inventory").select("capacity,quantity")\
             .eq("restaurant_id",str(rid)).order("capacity").execute()
+        
         if not inv.data:
+            # Fallback: simple count
             bk = supabase.table("bookings").select("id",count="exact")\
                 .eq("restaurant_id",rid)\
                 .eq("booking_time",booking_time.strftime("%Y-%m-%d %H:%M:%S%z"))\
                 .neq("status","cancelled").execute()
-            return ((bk.count or 0) < 10, "available (fallback)") if (bk.count or 0) < 10 \
-                else (False, "fully booked")
+            available = (bk.count or 0) < 10
+            return (available, "available (simple fallback)") if available else (False, "fully booked")
 
-        available: Dict[int,int] = {r["capacity"]:r["table_count"] for r in inv.data}
-        sizes = sorted(available.keys())
-
-        # CRITICAL FIX: Check if party size exceeds total capacity
-        total_seats = sum(cap * qty for cap, qty in available.items())
+        # 2. Build initial inventory map
+        total_inventory: Dict[int,int] = {r["capacity"]:r["quantity"] for r in inv.data}
+        sizes = sorted(total_inventory.keys())
+        
+        # 3. Quick check: does party exceed total capacity?
+        total_seats = sum(cap * qty for cap, qty in total_inventory.items())
         if party_size > total_seats:
-            return (False, f"party of {party_size} exceeds total capacity ({total_seats} seats)")
+            return (False, f"party of {party_size} exceeds restaurant capacity ({total_seats} seats)")
 
-
-        # Deduct tables already booked at this slot
-        bk = supabase.table("bookings").select("party_size")\
+        # 4. Fetch all bookings at this time slot
+        bk = supabase.table("bookings").select("party_size,session_id,customer_name")\
             .eq("restaurant_id",rid)\
             .eq("booking_time",booking_time.strftime("%Y-%m-%d %H:%M:%S%z"))\
             .neq("status","cancelled").execute()
-        for b in (bk.data or []):
-            ps = b["party_size"]
-            for cap in sizes:
-                if cap >= ps and available.get(cap,0) > 0:
-                    available[cap] -= 1; break
+        
+        existing_bookings = bk.data or []
+        
+        # 5. Simulate allocation for ALL existing bookings + this new one
+        # This is the CORRECT approach - we need to see if ALL parties can be seated
+        all_parties = [b["party_size"] for b in existing_bookings] + [party_size]
+        
+        # Try to allocate tables for all parties
+        allocated = allocate_tables(total_inventory.copy(), all_parties)
+        
+        if allocated:
+            # Success! Show what tables would be used for THIS party
+            tables_for_this_party = allocated[-1]  # Last allocation is for the new party
+            table_desc = ", ".join(f"{qty}x{cap}-seat" for cap, qty in sorted(tables_for_this_party.items()))
+            return (True, f"available ({table_desc})")
+        else:
+            # Failed - see what's already taken
+            already_allocated = allocate_tables(total_inventory.copy(), existing_bookings)
+            if already_allocated:
+                # Show remaining capacity
+                remaining = total_inventory.copy()
+                for booking_tables in already_allocated:
+                    for cap, qty in booking_tables.items():
+                        remaining[cap] = remaining.get(cap, 0) - qty
+                remaining_seats = sum(cap * qty for cap, qty in remaining.items())
+                return (False, f"insufficient tables (only {remaining_seats} seats remain, but party needs {party_size})")
             else:
-                rem = ps
-                for cap in sizes:
-                    while rem > 0 and available.get(cap,0) > 0:
-                        available[cap] -= 1; rem -= cap
-
-        # Greedy bin-pack: smallest table first (efficiency)
-        remaining = party_size
-        used: List[str] = []
-        for cap in sizes:
-            while remaining > 0 and available.get(cap,0) > 0:
-                available[cap] -= 1; remaining -= cap; used.append(f"{cap}-seater")
-        if remaining <= 0:
-            return True, f"seats available ({', '.join(used)})"
-        return False, "not enough tables for that party size"
+                return (False, "no available tables for this party size")
+                
     except Exception as ex:
-        print(f"[AVAIL] {ex}")
-        # Fallback: if no inventory defined, use simple count<10 check
-        try:
-            res = supabase.table("bookings") \
-                .select("id", count="exact") \
-                .eq("restaurant_id", rid) \
-                .eq("booking_time", booking_time.strftime("%Y-%m-%d %H:%M:%S%z")) \
-                .neq("status", "cancelled") \
-                .execute()
-            available = (res.count or 0) < 10
-            return (available, "Available" if available else "Fully booked (simple check)")
-        except Exception:
-            return (False, f"Availability check error: {ex}")
-    # Fallback: if no inventory defined, use simple count<10 check
-        try:
-            res = supabase.table("bookings") \
-                .select("id", count="exact") \
-                .eq("restaurant_id", rid) \
-                .eq("booking_time", booking_time.strftime("%Y-%m-%d %H:%M:%S%z")) \
-                .neq("status", "cancelled") \
-                .execute()
-            available = (res.count or 0) < 10
-            return (available, "Available" if available else "Fully booked (simple check)")
-        except Exception:
-            return (False, f"Availability check error: {ex}")
+        print(f"[AVAIL ERROR] {ex}")
+        import traceback
+        traceback.print_exc()
+        return (False, f"availability check error: {ex}")
+
+
+def allocate_tables(inventory: Dict[int,int], parties: List[int]) -> Optional[List[Dict[int,int]]]:
+    """
+    Try to allocate tables for all parties. Returns list of allocations or None if impossible.
+    Each allocation is a dict: {capacity: quantity_used}
+    
+    Uses greedy bin-packing: for each party, try to use the smallest combination of tables.
+    """
+    allocations = []
+    available = inventory.copy()
+    sizes = sorted(available.keys())
+    
+    for party_size in parties:
+        # Try to seat this party using available tables
+        allocation = {}
+        remaining = party_size
+        
+        # Strategy: Use exact match first, then smallest-first combination
+        
+        # 1. Check for exact capacity match
+        for cap in sizes:
+            if cap == party_size and available.get(cap, 0) > 0:
+                allocation[cap] = 1
+                available[cap] -= 1
+                remaining = 0
+                break
+        
+        # 2. If no exact match, use smallest-first greedy
+        if remaining > 0:
+            for cap in sizes:
+                while remaining > 0 and available.get(cap, 0) > 0:
+                    # Use this table
+                    allocation[cap] = allocation.get(cap, 0) + 1
+                    available[cap] -= 1
+                    remaining -= cap
+                    
+                    # Important: stop if we've seated everyone
+                    if remaining <= 0:
+                        break
+        
+        # 3. Check if we seated everyone
+        if remaining > 0:
+            # Failed to allocate for this party
+            return None
+        
+        allocations.append(allocation)
+    
+    return allocations
 
 def check_duplicate_booking(session_id, rid, booking_time):
     """Check if THIS session already has a booking at this exact time."""
@@ -874,7 +914,19 @@ async def handle_order_mode_chat(update: Update, context: ContextTypes.DEFAULT_T
         )
         if result:
             rt, _oid = result
-            await update.message.reply_text(rt, parse_mode="Markdown", reply_markup=back_button()); return
+            await update.message.reply_text(rt, parse_mode="Markdown", reply_markup=back_button())
+            return
+        else:
+            # FIXED: Give helpful error when order fails
+            await update.message.reply_text(
+                "❌ I couldn't understand your order.\n\n"
+                "💡 Try:\n"
+                "• Use full item names from the menu\n"
+                "• Example: '2 Binary Bites and a Java Jolt'\n"
+                "• Or say /menu to see all items",
+                reply_markup=back_button()
+            )
+            return
 
     try:
         rows = supabase.table("menu_items").select("content").eq("restaurant_id",rid).limit(30).execute()
