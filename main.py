@@ -414,17 +414,19 @@ async def handle_name_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uc["display_name"] = name
     session_id = uc.get("session_id")
     
-    # CRITICAL FIX: Store session with display name so we can track this "customer"
+    # CRITICAL FIX: Store session with display name - always INSERT, never update
     try:
-        supabase.table("user_sessions").upsert({
+        supabase.table("user_sessions").insert({
             "user_id": str(user.id),
             "session_id": session_id,
             "display_name": name,
+            "visit_count": 0,
+            "total_spend": 0.0,
             "created_at": get_dubai_now().isoformat()
         }).execute()
-        print(f"[SESSION] Stored name={name} for session={session_id[:8]}")
+        print(f"[SESSION] Created new session name={name} id={session_id[:8]}")
     except Exception as ex:
-        print(f"[SESSION STORE] {ex}")
+        print(f"[SESSION INSERT] {ex}")
     # CRITICAL FIX: Load CRM based on session, not user_id
     # For new session with new name, treat as new customer
     # Check if this session already has visit history
