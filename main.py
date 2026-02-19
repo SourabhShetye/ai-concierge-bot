@@ -263,11 +263,11 @@ def check_granular_availability(rid: str, booking_time: datetime, party_size: in
         except Exception:
             return (False, f"Availability check error: {ex}")
 
-def check_duplicate_booking(uid, rid, booking_time):
-    """Check if THIS user already has a booking at this exact time."""
+def check_duplicate_booking(session_id, rid, booking_time):
+    """Check if THIS session already has a booking at this exact time."""
     try:
         res = supabase.table("bookings").select("id")\
-            .eq("user_id",str(uid)).eq("restaurant_id",rid)\
+            .eq("session_id", str(session_id)).eq("restaurant_id", rid)\
             .eq("booking_time",booking_time.strftime("%Y-%m-%d %H:%M:%S%z"))\
             .neq("status","cancelled").execute()
         return bool(res.data)
@@ -300,10 +300,18 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     print(f"[START] Hard reset uid={user.id}")
 
+    # CRITICAL FIX: Generate unique session ID for this conversation
+    # This allows same Telegram account to simulate multiple customers
+    import uuid
+    session_id = str(uuid.uuid4())
+    
     uc = get_user_context(user.id, context)
+    uc["session_id"] = session_id  # NEW: unique per /start
     uc["restaurant_id"] = restaurant_id
     uc["restaurant_name"] = restaurant_name
     uc["chat_id"] = chat_id
+    
+    print(f"[SESSION] New session_id={session_id[:8]} for uid={user.id}")
 
     try:
         supabase.table("users").upsert({
@@ -327,8 +335,22 @@ async def handle_name_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(name) < 2 or name.isdigit():
         await update.message.reply_text("Please enter your name (e.g. *Sarah* or *Ahmed*).", parse_mode="Markdown")
         return
+    
     uc = get_user_context(user.id, context)
     uc["display_name"] = name
+    session_id = uc.get("session_id")
+    
+    # CRITICAL FIX: Store session with display name so we can track this "customer"
+    try:
+        supabase.table("user_sessions").upsert({
+            "user_id": str(user.id),
+            "session_id": session_id,
+            "display_name": name,
+            "created_at": get_dubai_now().isoformat()
+        }).execute()
+        print(f"[SESSION] Stored name={name} for session={session_id[:8]}")
+    except Exception as ex:
+        print(f"[SESSION STORE] {ex}")
     crm = load_crm_profile(str(user.id))
     uc.update({"visit_count":crm["visit_count"],"total_spend":crm["total_spend"],
                "tags":crm["tags"],"preferences":crm["preferences"]})
@@ -443,14 +465,16 @@ async def handle_booking_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text(f"❌ {reason}.\n\nPlease try a different time.",
                 reply_markup=back_button()); return
         
-        if check_duplicate_booking(user.id, rid, bt):
+        if check_duplicate_booking(uc.get("session_id", ""), rid, bt):
             await update.message.reply_text("❌ You already have a booking at that time.",reply_markup=back_button())
             clear_user_state(user.id, context); return
         
         try:
             supabase.table("bookings").insert({
-                "restaurant_id":rid,"user_id":str(user.id),
-                "customer_name":uc.get("display_name") or user.full_name or "Guest",
+                "restaurant_id": rid,
+                "user_id": str(user.id),
+                "session_id": uc.get("session_id", ""),  # NEW
+                "customer_name": uc.get("display_name") or user.full_name or "Guest",
                 "party_size":party,"booking_time":bt.strftime("%Y-%m-%d %H:%M:%S%z"),"status":"confirmed",
             }).execute()
             increment_visit(str(user.id)); uc["visit_count"] = uc.get("visit_count",0)+1
@@ -611,14 +635,17 @@ async def handle_table_assignment(update: Update, context: ContextTypes.DEFAULT_
     # CRITICAL FIX: Check if this table is already in use by another customer
     try:
         # Check if there are active orders at this table from OTHER users
-        existing = supabase.table("orders").select("user_id,customer_name")\
+        existing = supabase.table("orders").select("user_id,session_id,customer_name")\
             .eq("restaurant_id", rid)\
             .eq("table_number", str(tnum))\
             .neq("status", "paid").neq("status", "cancelled")\
             .execute()
         
         # Filter out orders from THIS user (they can reuse their own table)
-        other_users = [o for o in (existing.data or []) if o["user_id"] != str(user.id)]
+        # FIXED: Filter by session_id not user_id
+        current_session = uc.get("session_id", "")
+        other_sessions = [o for o in (existing.data or []) 
+                          if o.get("session_id") != current_session]
         
         if other_users:
             other_name = other_users[0].get("customer_name", "another customer")
@@ -839,8 +866,12 @@ async def handle_order_mode_chat(update: Update, context: ContextTypes.DEFAULT_T
         await calculate_bill(update, context); return
 
     if uc.get("table_number"):
-        result = await process_order(text, user, rid, uc.get("table_number"),
-                                     uc.get("chat_id"), user_preferences=uc.get("preferences",""))
+        result = await process_order(
+            text, user, rid, uc.get("table_number"), uc.get("chat_id"),
+            user_preferences=uc.get("preferences",""),
+            session_id=uc.get("session_id", ""),
+            display_name=uc.get("display_name", "")
+        )
         if result:
             rt, _oid = result
             await update.message.reply_text(rt, parse_mode="Markdown", reply_markup=back_button()); return

@@ -183,7 +183,15 @@ async def process_new_order(
     user_text: str, user, restaurant_id: str,
     table_number: str, chat_id: str,
     user_preferences: str = "",
+    session_id: str = "",
+    display_name: str = "",
 ) -> Optional[Tuple[str, int]]:
+    return await process_new_order(
+        user_text, user, restaurant_id, table_number, chat_id,
+        user_preferences=user_preferences,
+        session_id=session_id,
+        display_name=display_name,
+    )
     """
     Parse a natural-language order. Returns (reply, order_id) or None.
 
@@ -246,9 +254,12 @@ RULES:
             total_price = round(sum(float(p) for p in bare), 2) if bare else 0.0
 
         result   = supabase.table("orders").insert({
-            "restaurant_id": str(restaurant_id), "user_id": str(user.id),
-            "chat_id": str(chat_id), "table_number": str(table_number),
-            "customer_name": user.full_name or "Guest",
+            "restaurant_id":        str(restaurant_id),
+            "user_id":              str(user.id),
+            "session_id":           session_id,  # NEW
+            "chat_id":              str(chat_id),
+            "table_number":         str(table_number),
+            "customer_name":        display_name or user.full_name or "Guest",
             "items": items_str, "price": total_price, "status": "pending",
             "cancellation_status": "none", "modification_status": "none",
             "pending_modification": None,
