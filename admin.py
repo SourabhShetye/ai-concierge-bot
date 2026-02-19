@@ -556,15 +556,22 @@ with tab6:
                     f"Last visit: {f'{days_since}d ago' if days_since is not None else 'Never'}"
                 )
                 
-                # Show session creation time
+                # Show session creation time (safe)
                 try:
-                    created_dt = datetime.fromisoformat(str(created_at).replace("Z","+00:00"))
-                    created_str = to_dubai(created_dt).strftime("%b %d, %I:%M %p")
-                    detail_cols[1].caption(f"First seen: {created_str}")
-                except Exception:
-                    detail_cols[1].caption(f"Session: {session_id[:8]}...")
+                    if created_at:
+                        created_dt = datetime.fromisoformat(str(created_at).replace("Z","+00:00"))
+                        created_str = to_dubai(created_dt).strftime("%b %d, %I:%M %p")
+                        detail_cols[1].caption(f"First seen: {created_str}")
+                    else:
+                        session_short = str(session_id)[:8] if session_id else "unknown"
+                        detail_cols[1].caption(f"Session: {session_short}...")
+                except Exception as ex:
+                    session_short = str(session_id)[:8] if session_id else "unknown"
+                    detail_cols[1].caption(f"Session: {session_short}...")
                 
-                detail_cols[2].caption(f"Telegram User: `{user_id[:12]}...`")
+                # Show user_id (safe)
+                user_id_short = str(user_id)[:12] if user_id else "N/A"
+                detail_cols[2].caption(f"Telegram User: `{user_id_short}...`")
 
     st.markdown("---")
     st.caption("💡 Each session represents a unique customer conversation (name entered at /start).")
