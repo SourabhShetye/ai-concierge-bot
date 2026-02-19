@@ -186,12 +186,6 @@ async def process_new_order(
     session_id: str = "",
     display_name: str = "",
 ) -> Optional[Tuple[str, int]]:
-    return await process_new_order(
-        user_text, user, restaurant_id, table_number, chat_id,
-        user_preferences=user_preferences,
-        session_id=session_id,
-        display_name=display_name,
-    )
     """
     Parse a natural-language order. Returns (reply, order_id) or None.
 
@@ -292,16 +286,18 @@ CRITICAL RULES:
 
     except Exception as ex:
         import traceback; print(f"[NEW ORDER] {ex}"); traceback.print_exc(); return None
-
-
 # ── Public entry point ─────────────────────────────────────────────────────────
 
 async def process_order(
     user_text: str, user, restaurant_id: str,
     table_number: str, chat_id: str,
     user_preferences: str = "",
+    session_id: str = "",
+    display_name: str = "",
 ) -> Optional[Tuple[str, int]]:
     return await process_new_order(
         user_text, user, restaurant_id, table_number, chat_id,
         user_preferences=user_preferences,
+        session_id=session_id,
+        display_name=display_name,
     )

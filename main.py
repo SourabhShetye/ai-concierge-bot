@@ -236,7 +236,7 @@ def check_granular_availability(rid: str, booking_time: datetime, party_size: in
             return (True, f"available ({table_desc})")
         else:
             # Failed - see what's already taken
-            already_allocated = allocate_tables(total_inventory.copy(), existing_bookings)
+            already_allocated = allocate_tables(total_inventory.copy(), [b["party_size"] for b in existing_bookings])
             if already_allocated:
                 # Show remaining capacity
                 remaining = total_inventory.copy()
@@ -254,6 +254,29 @@ def check_granular_availability(rid: str, booking_time: datetime, party_size: in
         traceback.print_exc()
         return (False, f"availability check error: {ex}")
 
+def find_available_slots(rid: str, party_size: int, start_date: datetime) -> List[str]:
+    """
+    Find next 5 available time slots for given party size.
+    Returns list of formatted time strings.
+    """
+    available_slots = []
+    current = start_date.replace(minute=0)  # Round to hour
+    
+    # Check next 48 hours in 1-hour increments
+    for hour_offset in range(48):
+        check_time = current + timedelta(hours=hour_offset)
+        
+        # Only check during restaurant hours (8am-11pm)
+        if not (8 <= check_time.hour <= 23):
+            continue
+            
+        can_seat, _ = check_granular_availability(rid, check_time, party_size)
+        if can_seat:
+            available_slots.append(check_time.strftime("%b %d at %I:%M %p"))
+            if len(available_slots) >= 5:
+                break
+    
+    return available_slots
 
 def allocate_tables(inventory: Dict[int,int], parties: List[int]) -> Optional[List[Dict[int,int]]]:
     """
@@ -391,7 +414,37 @@ async def handle_name_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(f"[SESSION] Stored name={name} for session={session_id[:8]}")
     except Exception as ex:
         print(f"[SESSION STORE] {ex}")
-    crm = load_crm_profile(str(user.id))
+    # CRITICAL FIX: Load CRM based on session, not user_id
+    # For new session with new name, treat as new customer
+    # Check if this session already has visit history
+    try:
+        sess_check = supabase.table("user_sessions").select("visit_count,total_spend,last_visit")\
+            .eq("session_id", session_id).limit(1).execute()
+        
+        if sess_check.data and sess_check.data[0].get("visit_count", 0) > 0:
+            # This session has history, use it
+            crm = {
+                "visit_count": int(sess_check.data[0].get("visit_count", 0)),
+                "total_spend": float(sess_check.data[0].get("total_spend", 0.0)),
+                "last_visit": sess_check.data[0].get("last_visit"),
+                "preferences": "",
+                "tags": []
+            }
+            # Recompute tags for this session
+            vc = crm["visit_count"]
+            ts = crm["total_spend"]
+            tags = []
+            if vc > 5: tags.append("Frequent Diner")
+            if ts > 500: tags.append("Big Spender")
+            if "Frequent Diner" in tags and "Big Spender" in tags: tags.append("VIP")
+            crm["tags"] = tags
+        else:
+            # New session, treat as new customer
+            crm = {"visit_count":0,"total_spend":0.0,"last_visit":None,"preferences":"","tags":[]}
+    except Exception as ex:
+        print(f"[SESS CRM] {ex}")
+        # Fallback to new customer
+        crm = {"visit_count":0,"total_spend":0.0,"last_visit":None,"preferences":"","tags":[]}
     uc.update({"visit_count":crm["visit_count"],"total_spend":crm["total_spend"],
                "tags":crm["tags"],"preferences":crm["preferences"]})
     greeting = build_personalized_greeting(name, uc.get("restaurant_name","Our Restaurant"), crm["tags"])
@@ -502,8 +555,17 @@ async def handle_booking_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
         
         can_seat, reason = check_granular_availability(rid, bt, party)
         if not can_seat:
-            await update.message.reply_text(f"❌ {reason}.\n\nPlease try a different time.",
-                reply_markup=back_button()); return
+            # Show available alternatives
+            alternatives = find_available_slots(rid, party, bt)
+            alt_msg = ""
+            if alternatives:
+                alt_msg = f"\n\n✅ *Available times for {party} guests:*\n" + "\n".join(f"  • {slot}" for slot in alternatives)
+            
+            await update.message.reply_text(
+                f"❌ *Not Available*\n\n{reason}.{alt_msg}\n\nPlease choose a different time.",
+                reply_markup=back_button(), parse_mode="Markdown"
+            )
+            return
         
         if check_duplicate_booking(uc.get("session_id", ""), rid, bt):
             await update.message.reply_text("❌ You already have a booking at that time.",reply_markup=back_button())
@@ -517,7 +579,15 @@ async def handle_booking_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
                 "customer_name": uc.get("display_name") or user.full_name or "Guest",
                 "party_size":party,"booking_time":bt.strftime("%Y-%m-%d %H:%M:%S%z"),"status":"confirmed",
             }).execute()
-            increment_visit(str(user.id)); uc["visit_count"] = uc.get("visit_count",0)+1
+            # Track visit for this session
+            uc["visit_count"] = uc.get("visit_count",0)+1
+            try:
+                supabase.table("user_sessions").update({
+                    "visit_count": uc["visit_count"],
+                    "last_visit": get_dubai_now().isoformat()
+                }).eq("session_id", uc.get("session_id", "")).execute()
+            except Exception as ex:
+                print(f"[SESS VISIT] {ex}")
             await update.message.reply_text(
                 f"✅ *Booking Confirmed!*\n\n👤 {uc.get('display_name','Guest')}\n"
                 f"👥 Guests: {party}\n📅 {bt.strftime('%B %d, %Y at %I:%M %p')}\n\nSee you soon!",
@@ -687,8 +757,8 @@ async def handle_table_assignment(update: Update, context: ContextTypes.DEFAULT_
         other_sessions = [o for o in (existing.data or []) 
                           if o.get("session_id") != current_session]
         
-        if other_users:
-            other_name = other_users[0].get("customer_name", "another customer")
+        if other_sessions:
+            other_name = other_sessions[0].get("customer_name", "another customer")
             await update.message.reply_text(
                 f"⚠️ *Table {tnum} is currently in use* by {other_name}.\n\n"
                 f"Please verify your table number and try again.",
