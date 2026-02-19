@@ -414,8 +414,9 @@ async def handle_name_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uc["display_name"] = name
     session_id = uc.get("session_id")
     
-    # CRITICAL FIX: Store session with display name - always INSERT, never update
+    # CRITICAL FIX: Store session with display name
     try:
+        # First, try INSERT (preferred - creates new row)
         supabase.table("user_sessions").insert({
             "user_id": str(user.id),
             "session_id": session_id,
@@ -424,9 +425,23 @@ async def handle_name_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "total_spend": 0.0,
             "created_at": get_dubai_now().isoformat()
         }).execute()
-        print(f"[SESSION] Created new session name={name} id={session_id[:8]}")
+        print(f"[SESSION] ✅ Created new session name={name} id={session_id[:8]}")
     except Exception as ex:
-        print(f"[SESSION INSERT] {ex}")
+        # If INSERT fails (duplicate session_id?), try UPSERT as fallback
+        print(f"[SESSION INSERT FAILED] {ex}, trying upsert...")
+        try:
+            supabase.table("user_sessions").upsert({
+                "user_id": str(user.id),
+                "session_id": session_id,
+                "display_name": name,
+                "visit_count": 0,
+                "total_spend": 0.0,
+                "created_at": get_dubai_now().isoformat()
+            }, on_conflict="session_id").execute()
+            print(f"[SESSION] ⚠️ Upserted session name={name} id={session_id[:8]}")
+        except Exception as ex2:
+            print(f"[SESSION UPSERT FAILED] {ex2}")
+            # Session creation failed completely - this is bad but continue anyway
     # CRITICAL FIX: Load CRM based on session, not user_id
     # For new session with new name, treat as new customer
     # Check if this session already has visit history
