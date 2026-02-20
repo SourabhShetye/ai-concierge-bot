@@ -575,6 +575,19 @@ with tab6:
                 # Show user_id (safe)
                 user_id_short = str(user_id)[:12] if user_id else "N/A"
                 detail_cols[2].caption(f"Telegram User: `{user_id_short}...`")
+                
+                # Show PIN status (masked)
+                pin_hash = s.get("pin_hash")
+                if pin_hash:
+                    # Show masked PIN with view button
+                    pin_col1, pin_col2 = st.columns([3, 1])
+                    pin_col1.caption("🔐 PIN: ****")
+                    
+                    # Admin can view actual hash (for debugging/support)
+                    if pin_col2.button("👁️", key=f"view_pin_{s.get('session_id', '')[:8]}", help="View PIN hash"):
+                        st.code(pin_hash, language=None)
+                else:
+                    st.caption("🔓 No PIN set")
 
     st.markdown("---")
     st.caption("💡 Each session represents a unique customer conversation (name entered at /start).")

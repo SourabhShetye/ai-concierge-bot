@@ -56,7 +56,11 @@ class Mode(str, Enum):
 
 class UserState(str, Enum):
     IDLE                       = "idle"
+    AWAITING_CUSTOMER_TYPE     = "awaiting_customer_type"  # NEW
     AWAITING_NAME              = "awaiting_name"
+    AWAITING_PIN_SETUP         = "awaiting_pin_setup"      # NEW
+    AWAITING_PIN_CONFIRM       = "awaiting_pin_confirm"    # NEW
+    AWAITING_PIN_LOGIN         = "awaiting_pin_login"      # NEW
     AWAITING_TABLE             = "awaiting_table"
     HAS_TABLE                  = "has_table"
     AWAITING_ORDER_ID          = "awaiting_order_id"
@@ -409,9 +413,17 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }).execute()
     except Exception as ex: print(f"[UPSERT] {ex}")
 
-    set_user_state(user.id, UserState.AWAITING_NAME, context)
+    set_user_state(user.id, UserState.AWAITING_CUSTOMER_TYPE, context)
+    
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🆕 New Customer", callback_data="customer_type_new")],
+        [InlineKeyboardButton("🔙 Returning Customer", callback_data="customer_type_returning")],
+    ])
+    
     await update.message.reply_text(
-        f"👋 Welcome to *{restaurant_name}*!\n\nBefore we begin, what is your name?",
+        f"👋 Welcome to *{restaurant_name}*!\n\n"
+        f"Are you a new or returning customer?",
+        reply_markup=keyboard,
         parse_mode="Markdown",
     )
 
@@ -421,86 +433,339 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_name_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     name = update.message.text.strip()
+    
+    # Validation
     if len(name) < 2 or name.isdigit():
-        await update.message.reply_text("Please enter your name (e.g. *Sarah* or *Ahmed*).", parse_mode="Markdown")
+        await update.message.reply_text(
+            "❌ Please enter a valid name (at least 2 characters).\n"
+            "_Example: Sarah or Ahmed_",
+            parse_mode="Markdown"
+        )
         return
     
     uc = get_user_context(user.id, context)
     uc["display_name"] = name
-    session_id = uc.get("session_id")
+    restaurant_id = uc.get("restaurant_id")
+    customer_type = uc.get("customer_type", "new")
     
-    # Update the session with the actual name (session already created in /start)
+    # NEW CUSTOMER: Set up PIN
+    if customer_type == "new":
+        set_user_state(user.id, UserState.AWAITING_PIN_SETUP, context)
+        await update.message.reply_text(
+            f"✅ Name saved: *{name}*\n\n"
+            f"🔐 Now, create a 4-digit PIN for future visits:\n\n"
+            f"_This PIN will let you access your order history and rewards on future visits._",
+            parse_mode="Markdown"
+        )
+        return
+    
+    # RETURNING CUSTOMER: Check if exists
+    else:
+        try:
+            existing = supabase.table("user_sessions").select("session_id,pin_hash,visit_count,total_spend,last_visit")\
+                .eq("display_name", name)\
+                .eq("restaurant_id", restaurant_id)\
+                .is_("pin_hash", "not.null")\
+                .order("last_visit", desc=True)\
+                .limit(1).execute()
+            
+            if existing.data:
+                # Customer found - ask for PIN
+                uc["login_target_session"] = existing.data[0]
+                uc["login_attempts"] = 0
+                set_user_state(user.id, UserState.AWAITING_PIN_LOGIN, context)
+                
+                last_visit = existing.data[0].get("last_visit")
+                days_ago = ""
+                if last_visit:
+                    try:
+                        lv_dt = datetime.fromisoformat(str(last_visit).replace("Z", "+00:00"))
+                        days = (datetime.now(timezone.utc) - lv_dt).days
+                        days_ago = f" (last visit: {days} days ago)" if days > 0 else " (last visit: today)"
+                    except Exception:
+                        pass
+                
+                await update.message.reply_text(
+                    f"✅ Found your account, *{name}*!{days_ago}\n\n"
+                    f"📊 {existing.data[0]['visit_count']} visits • ${float(existing.data[0]['total_spend']):.2f} spent\n\n"
+                    f"🔐 Please enter your 4-digit PIN:",
+                    parse_mode="Markdown"
+                )
+            else:
+                # Customer not found
+                keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🆕 Create New Account", callback_data="customer_type_new")],
+                    [InlineKeyboardButton("🔄 Try Different Name", callback_data="customer_type_returning")],
+                ])
+                
+                await update.message.reply_text(
+                    f"❌ No account found for *{name}* at this restaurant.\n\n"
+                    f"Would you like to create a new account?",
+                    reply_markup=keyboard,
+                    parse_mode="Markdown"
+                )
+        except Exception as ex:
+            print(f"[NAME LOOKUP] {ex}")
+            await update.message.reply_text(
+                "❌ Error checking account. Please try again.",
+                parse_mode="Markdown"
+            )
+            
+async def handle_pin_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle new customer setting up their PIN"""
+    user = update.effective_user
+    pin = update.message.text.strip()
+    uc = get_user_context(user.id, context)
+    
+    # Delete the message containing PIN for security
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+    
+    # Validate PIN format
+    if not pin.isdigit() or len(pin) != 4:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="❌ PIN must be exactly 4 digits.\n\n"
+                 "Please try again:"
+        )
+        return
+    
+    # Store PIN temporarily for confirmation
+    uc["temp_pin"] = pin
+    set_user_state(user.id, UserState.AWAITING_PIN_CONFIRM, context)
+    
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="🔐 *Confirm your PIN*\n\n"
+             "Please enter your 4-digit PIN again to confirm:",
+        parse_mode="Markdown"
+    )
+
+
+async def handle_pin_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle PIN confirmation"""
+    user = update.effective_user
+    pin = update.message.text.strip()
+    uc = get_user_context(user.id, context)
+    
+    # Delete the message containing PIN
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+    
+    temp_pin = uc.get("temp_pin")
+    
+    if pin != temp_pin:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="❌ PINs don't match. Let's try again.\n\n"
+                 "Enter a 4-digit PIN:"
+        )
+        set_user_state(user.id, UserState.AWAITING_PIN_SETUP, context)
+        uc.pop("temp_pin", None)
+        return
+    
+    # Hash the PIN using bcrypt (install: pip install bcrypt)
+    import bcrypt
+    pin_hash = bcrypt.hashpw(pin.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+    
+    # Update session with PIN and name
+    session_id = uc.get("session_id")
+    name = uc.get("display_name")
+    restaurant_id = uc.get("restaurant_id")
+    
     try:
         supabase.table("user_sessions").update({
-            "display_name": name
+            "display_name": name,
+            "pin_hash": pin_hash
         }).eq("session_id", session_id).execute()
-        print(f"[SESSION] ✅ Updated name to '{name}' for session {session_id[:8]}")
-    except Exception as ex:
-        print(f"[SESSION UPDATE NAME FAILED] {ex}")
-        # Fallback: try to create it if it doesn't exist
-        try:
-            supabase.table("user_sessions").insert({
-                "user_id": str(user.id),
-                "session_id": session_id,
-                "restaurant_id": uc.get("restaurant_id"),  # CRITICAL: Link to restaurant
-                "display_name": name,
-                "visit_count": 0,
-                "total_spend": 0.0,
-                "created_at": get_dubai_now().isoformat()
-            }).execute()
-            print(f"[SESSION] ⚠️ Fallback: Created session for {name}")
-        except Exception as ex2:
-            print(f"[SESSION FALLBACK FAILED] {ex2}")
-    
-    # CRITICAL FIX: Load CRM based on session, not user_id
-    # For new session with new name, treat as new customer
-    # Check if this session already has visit history
-    try:
-        sess_check = supabase.table("user_sessions").select("visit_count,total_spend,last_visit")\
-            .eq("session_id", session_id).limit(1).execute()
         
-        if sess_check.data and sess_check.data[0].get("visit_count", 0) > 0:
-            # This session has history, use it
-            crm = {
-                "visit_count": int(sess_check.data[0].get("visit_count", 0)),
-                "total_spend": float(sess_check.data[0].get("total_spend", 0.0)),
-                "last_visit": sess_check.data[0].get("last_visit"),
-                "preferences": "",
-                "tags": []
-            }
-            # Recompute tags for this session
-            vc = crm["visit_count"]
-            ts = crm["total_spend"]
-            tags = []
-            if vc > 5: tags.append("Frequent Diner")
-            if ts > 500: tags.append("Big Spender")
-            if "Frequent Diner" in tags and "Big Spender" in tags: tags.append("VIP")
-            crm["tags"] = tags
-        else:
-            # New session, treat as new customer
-            crm = {"visit_count":0,"total_spend":0.0,"last_visit":None,"preferences":"","tags":[]}
+        print(f"[PIN SETUP] Created account for {name} (session: {session_id[:8]})")
     except Exception as ex:
-        print(f"[SESS CRM] {ex}")
-        # Fallback to new customer
-        crm = {"visit_count":0,"total_spend":0.0,"last_visit":None,"preferences":"","tags":[]}
+        print(f"[PIN SETUP ERROR] {ex}")
     
-    uc.update({"visit_count":crm["visit_count"],"total_spend":crm["total_spend"],
-               "tags":crm["tags"],"preferences":crm["preferences"]})
-    greeting = build_personalized_greeting(name, uc.get("restaurant_name","Our Restaurant"), crm["tags"])
-    tag_str  = ("  ·  ".join(f"🏷 {t}" for t in crm["tags"]) + "\n") if crm["tags"] else ""
-    pref_note = (f"\n\n📋 *Preferences on file:* _{crm['preferences']}_") if crm["preferences"] else ""
+    # Clean up temporary data
+    uc.pop("temp_pin", None)
+    uc.pop("customer_type", None)
+    
+    # Load CRM (new customer, so all zeros)
+    crm = {"visit_count": 0, "total_spend": 0.0, "last_visit": None, "preferences": "", "tags": []}
+    uc.update(crm)
+    
+    greeting = build_personalized_greeting(name, uc.get("restaurant_name", "Our Restaurant"), crm["tags"])
+    
     set_user_state(user.id, UserState.IDLE, context)
     set_mode(user.id, Mode.GENERAL, context)
-    await update.message.reply_text(
-        f"{greeting}\n_{tag_str}_\n\nYou're in *General Mode* — ask me anything about our menu, "
-        f"WiFi, parking, or policies.{pref_note}\n\nReady to order or book? Choose an option:",
-        reply_markup=main_menu_keyboard(), parse_mode="Markdown",
+    
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=f"✅ *Account Created!*\n\n"
+             f"{greeting}\n\n"
+             f"🔐 Your PIN is saved securely. Use it on your next visit!\n\n"
+             f"You're in *General Mode* — ask me anything about our menu, WiFi, parking, or policies.\n\n"
+             f"Ready to order or book? Choose an option:",
+        reply_markup=main_menu_keyboard(),
+        parse_mode="Markdown"
     )
+    
+async def handle_pin_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle returning customer entering PIN"""
+    user = update.effective_user
+    pin = update.message.text.strip()
+    uc = get_user_context(user.id, context)
+    
+    # Delete the message containing PIN
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+    
+    # Validate format
+    if not pin.isdigit() or len(pin) != 4:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="❌ PIN must be 4 digits. Please try again:"
+        )
+        return
+    
+    # Get stored hash
+    target_session = uc.get("login_target_session")
+    if not target_session:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="❌ Session expired. Please /start again."
+        )
+        return
+    
+    stored_hash = target_session.get("pin_hash")
+    attempts = uc.get("login_attempts", 0) + 1
+    uc["login_attempts"] = attempts
+    
+    # Verify PIN
+    import bcrypt
+    try:
+        pin_correct = bcrypt.checkpw(pin.encode('utf-8'), stored_hash.encode('utf-8'))
+    except Exception as ex:
+        print(f"[PIN VERIFY ERROR] {ex}")
+        pin_correct = False
+    
+    if pin_correct:
+        # SUCCESS - Link to existing account
+        name = uc.get("display_name")
+        current_session_id = uc.get("session_id")
+        target_session_id = target_session["session_id"]
+        
+        # Update current session to link to the found account
+        try:
+            supabase.table("user_sessions").update({
+                "display_name": name,
+                "pin_hash": stored_hash,
+                "primary_account_id": target_session_id  # Link to original account
+            }).eq("session_id", current_session_id).execute()
+        except Exception as ex:
+            print(f"[PIN LOGIN LINK] {ex}")
+        
+        # Load CRM data from target session
+        crm = {
+            "visit_count": int(target_session.get("visit_count", 0)),
+            "total_spend": float(target_session.get("total_spend", 0.0)),
+            "last_visit": target_session.get("last_visit"),
+            "preferences": target_session.get("preferences", ""),
+            "tags": []
+        }
+        
+        # Recompute tags
+        vc = crm["visit_count"]
+        ts = crm["total_spend"]
+        tags = []
+        if vc > 5: tags.append("Frequent Diner")
+        if ts > 500: tags.append("Big Spender")
+        if "Frequent Diner" in tags and "Big Spender" in tags: tags.append("VIP")
+        crm["tags"] = tags
+        
+        uc.update(crm)
+        uc.pop("login_target_session", None)
+        uc.pop("login_attempts", None)
+        uc.pop("customer_type", None)
+        
+        greeting = build_personalized_greeting(name, uc.get("restaurant_name", "Our Restaurant"), crm["tags"])
+        tag_str = ("  ·  ".join(f"🏷 {t}" for t in crm["tags"]) + "\n") if crm["tags"] else ""
+        
+        set_user_state(user.id, UserState.IDLE, context)
+        set_mode(user.id, Mode.GENERAL, context)
+        
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"✅ *Welcome Back!*\n\n"
+                 f"{greeting}\n_{tag_str}_\n\n"
+                 f"You're in *General Mode* — ask me anything about our menu, WiFi, parking, or policies.\n\n"
+                 f"Ready to order or book? Choose an option:",
+            reply_markup=main_menu_keyboard(),
+            parse_mode="Markdown"
+        )
+        
+        print(f"[PIN LOGIN] Success for {name} (session: {current_session_id[:8]} → {target_session_id[:8]})")
+    
+    else:
+        # FAILED - Wrong PIN
+        if attempts >= 3:
+            # Max attempts reached
+            uc.pop("login_target_session", None)
+            uc.pop("login_attempts", None)
+            
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Try Again", callback_data="customer_type_returning")],
+                [InlineKeyboardButton("🆕 Create New Account", callback_data="customer_type_new")],
+            ])
+            
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="❌ *Too Many Failed Attempts*\n\n"
+                     "For security, please start over or create a new account.",
+                reply_markup=keyboard,
+                parse_mode="Markdown"
+            )
+        else:
+            # Allow retry
+            remaining = 3 - attempts
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"❌ *Incorrect PIN*\n\n"
+                     f"You have {remaining} attempt(s) remaining.\n\n"
+                     f"Please try again:",
+                parse_mode="Markdown"
+            )
+
 # ── Button handler ─────────────────────────────────────────────────────────────
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
     user = update.effective_user; data = query.data; uc = get_user_context(user.id, context)
+    
+    # NEW CUSTOMER TYPE HANDLERS
+    if data == "customer_type_new":
+        set_user_state(user.id, UserState.AWAITING_NAME, context)
+        uc["customer_type"] = "new"
+        await query.message.reply_text(
+            "🆕 *New Customer Setup*\n\n"
+            "What is your name?\n"
+            "_Example: Sarah or Ahmed_",
+            parse_mode="Markdown"
+        )
+        return
+    
+    elif data == "customer_type_returning":
+        set_user_state(user.id, UserState.AWAITING_NAME, context)
+        uc["customer_type"] = "returning"
+        await query.message.reply_text(
+            "🔙 *Welcome Back!*\n\n"
+            "Please enter your name:",
+            parse_mode="Markdown"
+        )
+        return
 
     if data == "main_menu":
         reset_to_general(user.id, context)
@@ -1231,8 +1496,21 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as ex:
         print(f"[SESS CHECK] {ex}")
 
+    
     if state == UserState.AWAITING_NAME:
         await handle_name_input(update, context)
+        return
+    
+    if state == UserState.AWAITING_PIN_SETUP:
+        await handle_pin_setup(update, context)
+        return
+    
+    if state == UserState.AWAITING_PIN_CONFIRM:
+        await handle_pin_confirm(update, context)
+        return
+    
+    if state == UserState.AWAITING_PIN_LOGIN:
+        await handle_pin_login(update, context)
         return
 
     # NOW compute text_lower for other handlers
