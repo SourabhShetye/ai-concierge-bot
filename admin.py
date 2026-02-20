@@ -475,9 +475,18 @@ with tab6:
     try:
         # CRITICAL FIX: Filter sessions by current restaurant ONLY
         sessions_res = supabase.table("user_sessions").select(
-            "session_id,user_id,display_name,visit_count,total_spend,last_visit,created_at"
-        ).eq("restaurant_id", cur_rid).execute()  # ← FILTER BY RESTAURANT
-        all_sessions = sessions_res.data or []
+            "session_id,user_id,display_name,visit_count,total_spend,last_visit,created_at,pin_hash"
+        ).eq("restaurant_id", cur_rid).execute()
+        
+        # Filter out incomplete registrations (Guest placeholders with no PIN and no activity)
+        all_sessions = [
+            s for s in (sessions_res.data or [])
+            if not (
+                s.get("display_name") == "Guest" and 
+                not s.get("pin_hash") and 
+                int(s.get("visit_count", 0)) == 0
+            )
+        ]
     except Exception as ex:
         st.error(f"Error loading sessions: {ex}"); all_sessions = []
 
@@ -588,6 +597,59 @@ with tab6:
                         st.code(pin_hash, language=None)
                 else:
                     st.caption("🔓 No PIN set")
+                    
+        st.markdown("---")
+    
+    # Cleanup section (admin only)
+    with st.expander("🗑️ Cleanup Incomplete Registrations"):
+        st.caption("Remove Guest placeholders (sessions with no PIN and no activity)")
+        
+        try:
+            # Count incomplete sessions
+            # Get all Guest sessions
+            all_guests = supabase.table("user_sessions").select("session_id")\
+                .eq("restaurant_id", cur_rid)\
+                .eq("display_name", "Guest")\
+                .eq("visit_count", 0)\
+                .execute()
+
+            # Filter for those without PIN (in Python)
+            incomplete_sessions = [s for s in (all_guests.data or []) if not s.get("pin_hash")]
+            count = len(incomplete_sessions)
+
+            if count > 0:
+                st.warning(f"Found {count} incomplete registration(s)")
+                
+                if st.button("🗑️ Clean Up Now", type="primary"):
+                    # Delete each incomplete session
+                    for s in incomplete_sessions:
+                        supabase.table("user_sessions").delete()\
+                            .eq("session_id", s["session_id"]).execute()
+                    
+                    st.success(f"✅ Cleaned up {count} incomplete registration(s)")
+                    st.rerun()
+            
+            count = incomplete.count or 0
+            
+            if count > 0:
+                st.warning(f"Found {count} incomplete registration(s)")
+                
+                if st.button("🗑️ Clean Up Now", type="primary"):
+                    # Delete incomplete sessions
+                    supabase.table("user_sessions").delete()\
+                        .eq("restaurant_id", cur_rid)\
+                        .eq("display_name", "Guest")\
+                        .is_("pin_hash", "null")\
+                        .eq("visit_count", 0)\
+                        .execute()
+                    
+                    st.success(f"✅ Cleaned up {count} incomplete registration(s)")
+                    st.rerun()
+            else:
+                st.info("✅ No incomplete registrations to clean up")
+                
+        except Exception as ex:
+            st.error(f"Error: {ex}")
 
     st.markdown("---")
     st.caption("💡 Each session represents a unique customer conversation (name entered at /start).")

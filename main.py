@@ -462,20 +462,24 @@ async def handle_name_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # RETURNING CUSTOMER: Check if exists
     else:
         try:
-            existing = supabase.table("user_sessions").select("session_id,pin_hash,visit_count,total_spend,last_visit")\
+            # Query all sessions with this name at this restaurant
+            all_sessions = supabase.table("user_sessions").select("session_id,pin_hash,visit_count,total_spend,last_visit")\
                 .eq("display_name", name)\
                 .eq("restaurant_id", restaurant_id)\
-                .is_("pin_hash", "not.null")\
                 .order("last_visit", desc=True)\
-                .limit(1).execute()
+                .execute()
             
-            if existing.data:
+            # Filter for sessions with PIN set (completed registrations only)
+            sessions_with_pin = [s for s in (all_sessions.data or []) if s.get("pin_hash")]
+            
+            if sessions_with_pin:
                 # Customer found - ask for PIN
-                uc["login_target_session"] = existing.data[0]
+                target_session = sessions_with_pin[0]  # Most recent
+                uc["login_target_session"] = target_session
                 uc["login_attempts"] = 0
                 set_user_state(user.id, UserState.AWAITING_PIN_LOGIN, context)
                 
-                last_visit = existing.data[0].get("last_visit")
+                last_visit = target_session.get("last_visit")
                 days_ago = ""
                 if last_visit:
                     try:
@@ -487,7 +491,7 @@ async def handle_name_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 await update.message.reply_text(
                     f"✅ Found your account, *{name}*!{days_ago}\n\n"
-                    f"📊 {existing.data[0]['visit_count']} visits • ${float(existing.data[0]['total_spend']):.2f} spent\n\n"
+                    f"📊 {target_session['visit_count']} visits • ${float(target_session['total_spend']):.2f} spent\n\n"
                     f"🔐 Please enter your 4-digit PIN:",
                     parse_mode="Markdown"
                 )
@@ -506,8 +510,19 @@ async def handle_name_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
         except Exception as ex:
             print(f"[NAME LOOKUP] {ex}")
+            import traceback
+            traceback.print_exc()
+            
+            # Fallback: offer to retry or create new
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🆕 Create New Account", callback_data="customer_type_new")],
+                [InlineKeyboardButton("🔄 Try Again", callback_data="customer_type_returning")],
+            ])
+            
             await update.message.reply_text(
-                "❌ Error checking account. Please try again.",
+                "❌ Error checking account.\n\n"
+                "Would you like to create a new account or try again?",
+                reply_markup=keyboard,
                 parse_mode="Markdown"
             )
             
