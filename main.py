@@ -375,9 +375,23 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print(f"[START] Hard reset uid={user.id}")
 
     # CRITICAL FIX: Generate unique session ID for this conversation
-    # This allows same Telegram account to simulate multiple customers
     import uuid
     session_id = str(uuid.uuid4())
+    
+    # NEW: Create session row IMMEDIATELY (before name is entered)
+    try:
+        supabase.table("user_sessions").insert({
+            "user_id": str(user.id),
+            "session_id": session_id,
+            "display_name": "Guest",  # Placeholder, will be updated when name is entered
+            "visit_count": 0,
+            "total_spend": 0.0,
+            "created_at": get_dubai_now().isoformat()
+        }).execute()
+        print(f"[SESSION] ✅ Pre-created session {session_id[:8]} for uid={user.id}")
+    except Exception as ex:
+        print(f"[SESSION PRE-CREATE FAILED] {ex}")
+        # Continue anyway - session will be created on name input as fallback
     
     uc = get_user_context(user.id, context)
     uc["session_id"] = session_id  # NEW: unique per /start
@@ -414,34 +428,28 @@ async def handle_name_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uc["display_name"] = name
     session_id = uc.get("session_id")
     
-    # CRITICAL FIX: Store session with display name
+    # Update the session with the actual name (session already created in /start)
     try:
-        # First, try INSERT (preferred - creates new row)
-        supabase.table("user_sessions").insert({
-            "user_id": str(user.id),
-            "session_id": session_id,
-            "display_name": name,
-            "visit_count": 0,
-            "total_spend": 0.0,
-            "created_at": get_dubai_now().isoformat()
-        }).execute()
-        print(f"[SESSION] ✅ Created new session name={name} id={session_id[:8]}")
+        supabase.table("user_sessions").update({
+            "display_name": name
+        }).eq("session_id", session_id).execute()
+        print(f"[SESSION] ✅ Updated name to '{name}' for session {session_id[:8]}")
     except Exception as ex:
-        # If INSERT fails (duplicate session_id?), try UPSERT as fallback
-        print(f"[SESSION INSERT FAILED] {ex}, trying upsert...")
+        print(f"[SESSION UPDATE NAME FAILED] {ex}")
+        # Fallback: try to create it if it doesn't exist
         try:
-            supabase.table("user_sessions").upsert({
+            supabase.table("user_sessions").insert({
                 "user_id": str(user.id),
                 "session_id": session_id,
                 "display_name": name,
                 "visit_count": 0,
                 "total_spend": 0.0,
                 "created_at": get_dubai_now().isoformat()
-            }, on_conflict="session_id").execute()
-            print(f"[SESSION] ⚠️ Upserted session name={name} id={session_id[:8]}")
+            }).execute()
+            print(f"[SESSION] ⚠️ Fallback: Created session for {name}")
         except Exception as ex2:
-            print(f"[SESSION UPSERT FAILED] {ex2}")
-            # Session creation failed completely - this is bad but continue anyway
+            print(f"[SESSION FALLBACK FAILED] {ex2}")
+    
     # CRITICAL FIX: Load CRM based on session, not user_id
     # For new session with new name, treat as new customer
     # Check if this session already has visit history
@@ -473,6 +481,7 @@ async def handle_name_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(f"[SESS CRM] {ex}")
         # Fallback to new customer
         crm = {"visit_count":0,"total_spend":0.0,"last_visit":None,"preferences":"","tags":[]}
+    
     uc.update({"visit_count":crm["visit_count"],"total_spend":crm["total_spend"],
                "tags":crm["tags"],"preferences":crm["preferences"]})
     greeting = build_personalized_greeting(name, uc.get("restaurant_name","Our Restaurant"), crm["tags"])
@@ -485,8 +494,6 @@ async def handle_name_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"WiFi, parking, or policies.{pref_note}\n\nReady to order or book? Choose an option:",
         reply_markup=main_menu_keyboard(), parse_mode="Markdown",
     )
-
-
 # ── Button handler ─────────────────────────────────────────────────────────────
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
