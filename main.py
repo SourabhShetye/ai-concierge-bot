@@ -1212,17 +1212,19 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     # ALSO check if user_sessions says awaiting_feedback (set by admin panel)
     try:
-        sess = supabase.table("user_sessions").select("awaiting_feedback")\
-            .eq("user_id", str(user.id)).limit(1).execute()
-        if sess.data and sess.data[0].get("awaiting_feedback"):
-            # User was marked as awaiting feedback by payment system
-            set_user_state(user.id, UserState.AWAITING_FEEDBACK, context)
-            # Clear the flag
-            supabase.table("user_sessions").update({"awaiting_feedback": False})\
-                .eq("user_id", str(user.id)).execute()
-            # Now handle the feedback
-            await handle_feedback(update, context)
-            return
+        current_session = uc.get("session_id", "")
+        if current_session:
+            sess = supabase.table("user_sessions").select("awaiting_feedback")\
+                .eq("session_id", current_session).limit(1).execute()
+            if sess.data and sess.data[0].get("awaiting_feedback"):
+                # User was marked as awaiting feedback by payment system
+                set_user_state(user.id, UserState.AWAITING_FEEDBACK, context)
+                # Clear the flag
+                supabase.table("user_sessions").update({"awaiting_feedback": False})\
+                    .eq("session_id", current_session).execute()
+                # Now handle the feedback
+                await handle_feedback(update, context)
+                return
     except Exception as ex:
         print(f"[SESS CHECK] {ex}")
 

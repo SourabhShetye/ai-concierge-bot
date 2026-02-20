@@ -266,9 +266,11 @@ with tab3:
                 tn = o["table_number"]
                 if tn not in tables:
                     tables[tn] = {"orders":[],"total":0.0,"dish_names":set(),
-                                  "chat_id":o.get("chat_id"),"order_ids":[],"user_ids":set()}
+                                  "chat_id":o.get("chat_id"),"order_ids":[],"user_ids":set(),"session_ids":set()}
                 tables[tn]["orders"].append(o); tables[tn]["total"] += float(o["price"])
-                tables[tn]["order_ids"].append(o["id"]); tables[tn]["user_ids"].add(o.get("user_id",""))
+                tables[tn]["order_ids"].append(o["id"])
+                tables[tn]["user_ids"].add(o.get("user_id",""))
+                tables[tn]["session_ids"].add(o.get("session_id",""))
                 for item in o["items"].split(","):
                     c = item.split("(")[0].strip()
                     if c: tables[tn]["dish_names"].add(c)
@@ -287,22 +289,23 @@ with tab3:
                         try:
                             for oid in data["order_ids"]:
                                 supabase.table("orders").update({"status":"paid"}).eq("id",oid).execute()   
-                            # CRITICAL FIX: Set user state to AWAITING_FEEDBACK in user_sessions
-                            # Extract unique user IDs from this table's orders
-                            user_ids = list(data["user_ids"])
-                            if user_ids:
-                                # For simplicity, if multiple users at one table, set state for all
-                                # In practice, usually one user per table in the bot
-                                for uid in user_ids:
-                                    if uid:
-                                        try:
-                                            # Store feedback state in user_sessions table
-                                            supabase.table("user_sessions").upsert({
-                                                "user_id": str(uid),
-                                                "awaiting_feedback": True
-                                            }).execute()
-                                        except Exception as ex:
-                                            print(f"[FEEDBACK STATE] {ex}")
+                            # CRITICAL FIX: Set feedback state for each session at this table
+                            session_ids = set()
+                            for o in data["orders"]:
+                                sid = o.get("session_id")
+                                if sid:
+                                    session_ids.add(sid)
+                            
+                            if session_ids:
+                                for sid in session_ids:
+                                    try:
+                                        # Set awaiting_feedback flag for this session
+                                        supabase.table("user_sessions").update({
+                                            "awaiting_feedback": True
+                                        }).eq("session_id", sid).execute()
+                                        print(f"[FEEDBACK STATE] Set for session {sid[:8]}")
+                                    except Exception as ex:
+                                        print(f"[FEEDBACK STATE] {ex}")
                             # Track spending by user_id AND session_id
                             user_spend: dict = {}
                             session_spend: dict = {}
