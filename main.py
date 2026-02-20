@@ -383,7 +383,8 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         supabase.table("user_sessions").insert({
             "user_id": str(user.id),
             "session_id": session_id,
-            "display_name": "Guest",  # Placeholder, will be updated when name is entered
+            "restaurant_id": restaurant_id,  # CRITICAL: Link to restaurant
+            "display_name": "Guest",
             "visit_count": 0,
             "total_spend": 0.0,
             "created_at": get_dubai_now().isoformat()
@@ -441,6 +442,7 @@ async def handle_name_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             supabase.table("user_sessions").insert({
                 "user_id": str(user.id),
                 "session_id": session_id,
+                "restaurant_id": uc.get("restaurant_id"),  # CRITICAL: Link to restaurant
                 "display_name": name,
                 "visit_count": 0,
                 "total_spend": 0.0,
@@ -689,7 +691,7 @@ async def handle_booking_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
             supabase.table("bookings").insert({
                 "restaurant_id": rid,
                 "user_id": str(user.id),
-                "session_id": uc.get("session_id", ""),  # NEW
+                "session_id": uc.get("session_id", ""), 
                 "customer_name": uc.get("display_name") or user.full_name or "Guest",
                 "party_size":party,"booking_time":bt.strftime("%Y-%m-%d %H:%M:%S%z"),"status":"confirmed",
             }).execute()
@@ -1011,6 +1013,7 @@ async def handle_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         supabase.table("feedback").insert({
             "restaurant_id": uc.get("restaurant_id"),
             "user_id": str(user.id),
+            "session_id": uc.get("session_id"),  # ← ADD THIS
             "ratings": text,
             "created_at": get_dubai_now().isoformat(),
         }).execute()

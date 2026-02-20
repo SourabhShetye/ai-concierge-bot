@@ -473,10 +473,10 @@ with tab6:
         key="tag_filter")
 
     try:
-        # FIXED: Query user_sessions instead of users to get session-specific names
+        # CRITICAL FIX: Filter sessions by current restaurant ONLY
         sessions_res = supabase.table("user_sessions").select(
             "session_id,user_id,display_name,visit_count,total_spend,last_visit,created_at"
-        ).execute()
+        ).eq("restaurant_id", cur_rid).execute()  # ← FILTER BY RESTAURANT
         all_sessions = sessions_res.data or []
     except Exception as ex:
         st.error(f"Error loading sessions: {ex}"); all_sessions = []
