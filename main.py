@@ -1579,7 +1579,34 @@ async def telegram_webhook(request: Request):
 
 @app.get("/")
 async def health_check():
-    return {"status":"running","service":"Restaurant Concierge v6","timestamp":get_dubai_now().isoformat()}
+    """
+    Health check endpoint for UptimeRobot and monitoring services.
+    Returns 200 OK with simple JSON response.
+    """
+    try:
+        # Test database connection
+        test_query = supabase.table("restaurants").select("id").limit(1).execute()
+        db_status = "connected" if test_query else "disconnected"
+    except Exception as ex:
+        db_status = f"error: {str(ex)[:50]}"
+    
+    return {
+        "status": "healthy",
+        "service": "Restaurant Concierge v6",
+        "timestamp": get_dubai_now().isoformat(),
+        "database": db_status,
+        "version": "6.0.0"
+    }
+
+@app.get("/health")
+async def health():
+    """Alternative health check endpoint"""
+    return {"status": "ok"}
+
+@app.get("/ping")
+async def ping():
+    """Simple ping endpoint"""
+    return "pong"
 
 @app.on_event("startup")
 async def startup_event():

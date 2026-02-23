@@ -64,7 +64,7 @@ def compute_tags(row):
     if lv and vc > 0:
         try:
             lv_dt = datetime.fromisoformat(str(lv).replace("Z","+00:00"))
-            if (datetime.now(timezone.utc) - lv_dt) > timedelta(days=30):
+            if (datetime.now(timezone.utc) - lv_dt) > timedelta(days=2):
                 tags.append("Churn Risk")
         except Exception: pass
     return tags
@@ -605,18 +605,17 @@ with tab6:
         st.caption("Remove Guest placeholders (sessions with no PIN and no activity)")
         
         try:
-            # Count incomplete sessions
-            # Get all Guest sessions
-            all_guests = supabase.table("user_sessions").select("session_id")\
+            # Get all Guest sessions with no activity
+            all_guests = supabase.table("user_sessions").select("session_id,pin_hash")\
                 .eq("restaurant_id", cur_rid)\
                 .eq("display_name", "Guest")\
                 .eq("visit_count", 0)\
                 .execute()
-
+            
             # Filter for those without PIN (in Python)
             incomplete_sessions = [s for s in (all_guests.data or []) if not s.get("pin_hash")]
             count = len(incomplete_sessions)
-
+            
             if count > 0:
                 st.warning(f"Found {count} incomplete registration(s)")
                 
@@ -625,23 +624,6 @@ with tab6:
                     for s in incomplete_sessions:
                         supabase.table("user_sessions").delete()\
                             .eq("session_id", s["session_id"]).execute()
-                    
-                    st.success(f"✅ Cleaned up {count} incomplete registration(s)")
-                    st.rerun()
-            
-            count = incomplete.count or 0
-            
-            if count > 0:
-                st.warning(f"Found {count} incomplete registration(s)")
-                
-                if st.button("🗑️ Clean Up Now", type="primary"):
-                    # Delete incomplete sessions
-                    supabase.table("user_sessions").delete()\
-                        .eq("restaurant_id", cur_rid)\
-                        .eq("display_name", "Guest")\
-                        .is_("pin_hash", "null")\
-                        .eq("visit_count", 0)\
-                        .execute()
                     
                     st.success(f"✅ Cleaned up {count} incomplete registration(s)")
                     st.rerun()
