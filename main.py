@@ -19,6 +19,7 @@ from typing import Optional, Dict, Any, List, Tuple
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Request
+from fastapi.responses import Response, PlainTextResponse
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -1577,11 +1578,13 @@ async def telegram_webhook(request: Request):
     except Exception as ex:
         print(f"[WEBHOOK] {ex}"); return {"status":"error","message":str(ex)}
 
+# FIXED: Support both GET and HEAD requests
 @app.get("/")
+@app.head("/")
 async def health_check():
     """
     Health check endpoint for UptimeRobot and monitoring services.
-    Returns 200 OK with simple JSON response.
+    Supports both GET and HEAD requests.
     """
     try:
         # Test database connection
@@ -1599,14 +1602,16 @@ async def health_check():
     }
 
 @app.get("/health")
+@app.head("/health")
 async def health():
-    """Alternative health check endpoint"""
+    """Alternative health check endpoint - supports HEAD"""
     return {"status": "ok"}
 
 @app.get("/ping")
+@app.head("/ping")
 async def ping():
-    """Simple ping endpoint"""
-    return "pong"
+    """Simple ping endpoint - supports HEAD"""
+    return PlainTextResponse("pong", status_code=200)
 
 @app.on_event("startup")
 async def startup_event():
