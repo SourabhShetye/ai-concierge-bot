@@ -383,6 +383,10 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user, chat_id = update.effective_user, update.effective_chat.id
     restaurant_id, restaurant_name = None, "Our Restaurant"
 
+    # Parse QR code BEFORE any other logic
+    qr_table = None
+    qr_restaurant_id = None
+    
     if context.args:
         arg = context.args[0]
         rid = None  # Initialize rid variable
@@ -391,11 +395,11 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if arg.startswith("table_"):
             parts = arg.split("_")
             if len(parts) >= 3:
-                table_num = parts[1]
+                qr_table = parts[1]  # Store for later
                 rid = "_".join(parts[2:])  # rest_abc123
+                qr_restaurant_id = rid
                 
-                # We'll set table AFTER getting user context
-                print(f"[QR SCAN] Will assign Table {table_num}")
+                print(f"[QR SCAN] Will assign Table {qr_table} for restaurant {rid}")
         elif arg.startswith("rest_id="):
             rid = arg.split("=")[1]
         else:
@@ -441,12 +445,10 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uc = get_user_context(user.id, context)
     
     # NOW set table if QR scanned (after context is initialized)
-    if context.args and context.args[0].startswith("table_"):
-        parts = context.args[0].split("_")
-        if len(parts) >= 3:
-            uc["table_number"] = parts[1]
-            uc["qr_scanned"] = True
-            print(f"[QR SCAN] Table {parts[1]} auto-assigned to session {session_id[:8]}")
+    if qr_table:
+        uc["table_number"] = qr_table
+        uc["qr_scanned"] = True
+        print(f"[QR SCAN] Table {qr_table} auto-assigned to session {session_id[:8]}")
   
     uc["session_id"] = session_id  # NEW: unique per /start
     uc["restaurant_id"] = restaurant_id
@@ -760,8 +762,13 @@ async def handle_pin_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uc.pop("login_attempts", None)
         uc.pop("customer_type", None)
         
-        greeting = build_personalized_greeting(name, uc.get("restaurant_name", "Our Restaurant"), crm["tags"])
-        tag_str = ("  ·  ".join(f"🏷 {t}" for t in crm["tags"]) + "\n") if crm["tags"] else ""
+        greeting = build_personalized_greeting(
+            name, 
+            uc.get("restaurant_name", "Our Restaurant"), 
+            crm["tags"],
+            visit_count=crm["visit_count"]  # ADD THIS
+        )
+        tag_str = ("  ·  ".join(f"🏷 {t}" for t in crm["tags"]) + "\n\n") if crm["tags"] else ""
         
         set_user_state(user.id, UserState.IDLE, context)
         set_mode(user.id, Mode.GENERAL, context)
@@ -769,7 +776,8 @@ async def handle_pin_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text=f"✅ *Welcome Back!*\n\n"
-                 f"{greeting}\n_{tag_str}_\n\n"
+                 f"{greeting}\n\n"
+                 f"{tag_str}"
                  f"You're in *General Mode* — ask me anything about our menu, WiFi, parking, or policies.\n\n"
                  f"Ready to order or book? Choose an option:",
             reply_markup=main_menu_keyboard(),
@@ -1309,10 +1317,21 @@ async def handle_table_assignment(update: Update, context: ContextTypes.DEFAULT_
         print(f"[TABLE] {ex}")
     
     set_user_state(user.id, UserState.HAS_TABLE, context)
-    await update.message.reply_text(
-        f"✅ *Table {tnum} set!*\n\nWhat would you like to order?\n_Example: '2 Binary Bites and a Java Jolt'_",
-        reply_markup=back_button(), parse_mode="Markdown"
-    )
+    
+    # Check if preferences already set
+    if not uc.get("preferences"):
+        await update.message.reply_text(
+            f"✅ *Table {tnum} set!*\n\n"
+            f"⚠️ *Do you have any allergies or dietary restrictions?*\n\n"
+            f"_Examples: 'allergic to nuts', 'vegetarian', 'no gluten'_\n\n"
+            f"Or type *'none'* if you have no restrictions.",
+            reply_markup=back_button(), parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text(
+            f"✅ *Table {tnum} set!*\n\nWhat would you like to order?\n\n_Type /menu to see all available dishes._",
+            reply_markup=back_button(), parse_mode="Markdown"
+        )
 
 
 # ── Order ID handler ───────────────────────────────────────────────────────────
@@ -1321,16 +1340,69 @@ async def handle_order_id_input(update: Update, context: ContextTypes.DEFAULT_TY
     user = update.effective_user; text = update.message.text.strip()
     uc = get_user_context(user.id, context)
     nums = re.findall(r'\d+', text)
-    if not nums: await update.message.reply_text("❌ Type a valid order number.",reply_markup=back_button()); return
-    oid = int(nums[0]); rid = uc.get("restaurant_id")
-    action = uc.get("pending_action","cancel"); mint = uc.get("pending_mod_text","")
+    if not nums: 
+        await update.message.reply_text("❌ Type a valid order number.",reply_markup=back_button())
+        return
+    
+    oid = int(nums[0])
+    rid = uc.get("restaurant_id")
+    action = uc.get("pending_action","cancel")
+    
     order = fetch_order_for_user(oid, str(user.id), rid)
     if not order:
-        await update.message.reply_text(f"❌ Order *#{oid}* not found.",reply_markup=back_button(),parse_mode="Markdown"); return
-    clear_user_state(user.id, context); uc.pop("pending_action",None); uc.pop("pending_mod_text",None)
+        await update.message.reply_text(f"❌ Order *#{oid}* not found.",reply_markup=back_button(),parse_mode="Markdown")
+        return
+    
+    # If action is modify and we haven't asked what to modify yet
+    if action == "modify" and not uc.get("pending_mod_text"):
+        uc["pending_mod_order"] = order
+        set_user_state(user.id, UserState.AWAITING_ORDER_ID, context)  # Stay in this state
+        await update.message.reply_text(
+            f"📝 *Order #{oid}:* {order['items']}\n\n"
+            f"What would you like to change?\n\n"
+            f"_Examples:_\n"
+            f"• 'Remove 1 burger'\n"
+            f"• 'Remove the fries'\n"
+            f"• 'Cancel this order'",
+            parse_mode="Markdown",
+            reply_markup=back_button()
+        )
+        return
+    
+    # Process the modification
+    mint = uc.get("pending_mod_text", text)
+    clear_user_state(user.id, context)
+    uc.pop("pending_action",None)
+    uc.pop("pending_mod_text",None)
+    uc.pop("pending_mod_order",None)
+    
     reply = stage_cancellation(order) if action=="cancel" else await stage_modification(order, mint)
     await update.message.reply_text(reply, parse_mode="Markdown", reply_markup=back_button())
 
+async def handle_modification_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle the user's modification request after order ID selected"""
+    user = update.effective_user
+    text = update.message.text.strip()
+    uc = get_user_context(user.id, context)
+    
+    order = uc.get("pending_mod_order")
+    if not order:
+        await update.message.reply_text("❌ Session error. Please try again.",reply_markup=back_button())
+        clear_user_state(user.id, context)
+        return
+    
+    # Check if it's a cancellation
+    is_cancel = any(phrase in text.lower() for phrase in ["cancel","nevermind","never mind"])
+    
+    reply = stage_cancellation(order) if is_cancel else await stage_modification(order, text)
+    
+    # Clean up
+    clear_user_state(user.id, context)
+    uc.pop("pending_action",None)
+    uc.pop("pending_mod_text",None)
+    uc.pop("pending_mod_order",None)
+    
+    await update.message.reply_text(reply, parse_mode="Markdown", reply_markup=back_button())
 
 # ── /cancel order ──────────────────────────────────────────────────────────────
 
@@ -1486,22 +1558,79 @@ async def handle_order_mode_chat(update: Update, context: ContextTypes.DEFAULT_T
     if any(k in text_lower for k in ["change booking","modify booking","change reservation","modify reservation"]):
         await modify_booking_command(update, context); return
 
-    # Allergy detection
+    # Allergy detection - handle both new input and "none"
+    if state == UserState.HAS_TABLE and not uc.get("preferences_set"):
+        if text_lower in ["none", "no", "nope", "nothing", "n/a"]:
+            uc["preferences"] = ""
+            uc["preferences_set"] = True
+            await update.message.reply_text(
+                "✅ *Got it!*\n\nWhat would you like to order?\n\n_Type /menu to see all available dishes._",
+                reply_markup=back_button(), parse_mode="Markdown"
+            )
+            return
+        
+        # Check if it's allergy-related text
+        if _ALLERGY_PAT.search(text):
+            uc["preferences"] = text
+            uc["preferences_set"] = True
+            await update.message.reply_text(
+                f"📋 *Dietary restriction saved:* _{text}_\n\n"
+                f"I'll warn you if any dish conflicts with this.\n\n"
+                f"What would you like to order?\n\n_Type /menu to see all available dishes._",
+                parse_mode="Markdown", reply_markup=back_button()
+            )
+            return
+        # If not allergy-related, treat as order
+        else:
+            uc["preferences"] = ""
+            uc["preferences_set"] = True
+            # Continue to order processing below
+    
+    # Update existing preferences if mentioned later
     new_pref = detect_and_save_preferences(str(user.id), text, uc.get("preferences",""))
-    if new_pref is not None:
+    if new_pref is not None and uc.get("preferences_set"):
         uc["preferences"] = new_pref
-        await update.message.reply_text(f"📋 *Preference saved:* _{new_pref}_\n\nI'll warn you about conflicts.",
+        await update.message.reply_text(f"📋 *Preference updated:* _{new_pref}_\n\nI'll warn you about conflicts.",
             parse_mode="Markdown", reply_markup=back_button()); return
 
     # Modification trigger
     if any(k in text_lower for k in _MOD_KWS):
+        # Check if order ID is in the message
         oid_m = re.search(r'#?(\d{3,})', text)
-        if oid_m:
-            oid = int(oid_m.group(1)); order = fetch_order_for_user(oid, str(user.id), rid)
-            if order:
-                is_can = any(p in text_lower for p in ["cancel","nevermind","never mind"])
-                reply = stage_cancellation(order) if is_can else await stage_modification(order, text)
-                await update.message.reply_text(reply,parse_mode="Markdown",reply_markup=back_button()); return
+        
+        # If NO order ID provided, ask user which order to modify
+        if not oid_m:
+            try:
+                recent = supabase.table("orders").select("id,items,price")\
+                    .eq("user_id",str(user.id)).eq("restaurant_id",rid)\
+                    .eq("status","pending").order("created_at",desc=True).limit(5).execute()
+                if not recent.data: 
+                    await update.message.reply_text("❌ No active orders.",reply_markup=back_button())
+                    return
+                
+                lst = "\n".join(f"  *#{o['id']}* — {o['items']}  (${float(o['price']):.2f})" for o in recent.data)
+                uc["pending_action"] = "modify"
+                uc["pending_mod_text"] = ""  # Will ask for modification details next
+                set_user_state(user.id, UserState.AWAITING_ORDER_ID, context)
+                await update.message.reply_text(
+                    f"📋 *Your active orders:*\n{lst}\n\n"
+                    f"Type the *Order Number* you want to modify:",
+                    reply_markup=back_button(), parse_mode="Markdown"
+                )
+                return
+            except Exception as ex:
+                print(f"[MOD] {ex}")
+                await update.message.reply_text("❌ Error.",reply_markup=back_button())
+                return
+        
+        # If order ID IS provided, process modification
+        oid = int(oid_m.group(1))
+        order = fetch_order_for_user(oid, str(user.id), rid)
+        if order:
+            is_can = any(p in text_lower for p in ["cancel","nevermind","never mind"])
+            reply = stage_cancellation(order) if is_can else await stage_modification(order, text)
+            await update.message.reply_text(reply,parse_mode="Markdown",reply_markup=back_button())
+            return
         try:
             recent = supabase.table("orders").select("id,items,price")\
                 .eq("user_id",str(user.id)).eq("restaurant_id",rid)\
@@ -1534,13 +1663,31 @@ async def handle_order_mode_chat(update: Update, context: ContextTypes.DEFAULT_T
             await update.message.reply_text(rt, parse_mode="Markdown", reply_markup=back_button())
             return
         else:
-            # FIXED: Give helpful error when order fails
+            # Get available menu items for examples
+            examples = []
+            try:
+                menu_res = supabase.table("menu_items").select("content")\
+                    .eq("restaurant_id", rid)\
+                    .eq("sold_out", False).limit(5).execute()
+                
+                if menu_res.data:
+                    for item in menu_res.data[:3]:  # Get first 3 available items
+                        for line in item["content"].split("\n"):
+                            if line.startswith("item:"):
+                                item_name = line.replace("item:", "").strip()
+                                examples.append(item_name)
+                                break
+            except Exception:
+                examples = ["items from our menu"]
+            
+            example_text = ", ".join(examples[:2]) if examples else "items from menu"
+            
             await update.message.reply_text(
                 "❌ I couldn't understand your order.\n\n"
                 "💡 Try:\n"
-                "• Use full item names from the menu\n"
-                "• Example: '2 Binary Bites and a Java Jolt'\n"
-                "• Or say /menu to see all items",
+                f"• Use full item names (e.g., '{example_text}')\n"
+                "• Say /menu to see all available dishes\n"
+                "• Be specific with quantities (e.g., '2 Burgers')",
                 reply_markup=back_button()
             )
             return
@@ -1569,24 +1716,50 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
     user = update.effective_user
     uc = get_user_context(user.id, context)
     
+    await update.message.reply_text("🎤 Processing voice message...")
+    
     try:
         # Download voice file
         voice = update.message.voice
+        print(f"[VOICE] Received voice message from {user.id}, duration: {voice.duration}s")
         file = await context.bot.get_file(voice.file_id)
+        print(f"[VOICE] File downloaded: {file.file_path}")
         
         # Download to temporary file
         import tempfile
+        import subprocess
+        
         with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
             await file.download_to_drive(tmp.name)
-            tmp_path = tmp.name
+            ogg_path = tmp.name
+        
+        # Convert OGG to MP3 (Groq prefers MP3)
+        mp3_path = ogg_path.replace(".ogg", ".mp3")
+        try:
+            subprocess.run([
+                "ffmpeg", "-i", ogg_path, "-acodec", "libmp3lame", "-ar", "16000", mp3_path
+            ], check=True, capture_output=True)
+            audio_path = mp3_path
+            print(f"[VOICE] Converted to MP3: {mp3_path}")
+        except Exception as conv_ex:
+            print(f"[VOICE] Conversion failed, using original: {conv_ex}")
+            audio_path = ogg_path
         
         # Transcribe using Groq Whisper
         with open(tmp_path, "rb") as audio_file:
+            print(f"[VOICE] Sending to Groq Whisper API...")
             transcription = await groq_client.audio.transcriptions.create(
-                file=audio_file,
+                file=(tmp_path, audio_file),
                 model="whisper-large-v3",
                 response_format="text"
             )
+            print(f"[VOICE] Transcription received: {len(transcription)} chars")
+        
+        # Clean up both files
+        import os
+        os.unlink(ogg_path)
+        if os.path.exists(mp3_path):
+            os.unlink(mp3_path)
         
         # Clean up temp file
         import os
@@ -1681,7 +1854,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if state == UserState.AWAITING_ORDER_ID:
-        await handle_order_id_input(update, context)
+        # Check if we're waiting for modification details
+        if uc.get("pending_mod_order"):
+            await handle_modification_details(update, context)
+        else:
+            await handle_order_id_input(update, context)
         return
     if mode == Mode.BOOKING:
         if state in [UserState.AWAITING_GUESTS, UserState.AWAITING_TIME]:

@@ -460,19 +460,26 @@ with tab4:
                         sold_out = item_data.data[0].get("sold_out", False) if item_data.data else False
                     except Exception:
                         sold_out = False
+                    
                     if sold_out:
                         dc2.error("❌ SOLD OUT")
                     else:
                         dc2.write(f"💰 {p['price']}")
-                    # Sold out toggle button
-                    toggle_text = "✅ In Stock" if sold_out else "❌ Mark Sold Out"
+                    
+                    # Column 3: Sold out toggle button
+                    toggle_text = "✅ Stock" if sold_out else "❌ Sold Out"
                     if dc3.button(toggle_text, key=f"toggle_{rid_row}", use_container_width=True):
                         try:
                             supabase.table("menu_items").update({"sold_out": not sold_out}).eq("id", rid_row).execute()
                             st.rerun()
                         except Exception as ex:
                             st.error(f"{ex}")
-                    if dc4.button("✏️",key=f"eb_{rid_row}",use_container_width=True): st.session_state[ekey]=not st.session_state[ekey]
+                    
+                    # Column 4: Edit button
+                    if dc4.button("✏️",key=f"eb_{rid_row}",use_container_width=True): 
+                        st.session_state[ekey]=not st.session_state[ekey]
+                    
+                    # Column 5: Delete button
                     if dc5.button("🗑️",key=f"db_{rid_row}",use_container_width=True):
                         try: supabase.table("menu_items").delete().eq("id",rid_row).execute(); st.rerun()
                         except Exception as ex: st.error(f"{ex}")

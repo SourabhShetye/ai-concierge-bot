@@ -292,13 +292,13 @@ CRITICAL RULES:
 - If user says a quantity WITHOUT item name, match to closest menu item:
   * "2 of 404" → "2x 404 Fizz Not Found"
 - Only list items from the menu above (but be flexible with naming)
-- Format each item as: ItemName ($price)
-- For multiples: Nx ItemName ($TOTAL_PRICE_FOR_ALL_N)
+- Format SINGLE items as: ItemName ($price)
+- Format MULTIPLE items as: Nx ItemName ($unit_price each)
   CRITICAL EXAMPLES:
-  * 1x Carbonara at $32 each = "Carbonara ($32)"
-  * 2x Carbonara at $32 each = "2x Carbonara ($64)"  ← $32 × 2 = $64
-  * 3x Fries at $7 each = "3x Fries ($21)"  ← $7 × 3 = $21
-  The price in parentheses must be the TOTAL for that line item!
+  * 1x Carbonara at $32 = "Carbonara ($32)"
+  * 2x Carbonara at $32 each = "2x Carbonara ($32 each)"
+  * 3x Fries at $7 each = "3x Fries ($7 each)"
+  The price shows UNIT PRICE with "each" suffix for clarity!
 - Do NOT include total_price field
 """
         c = await groq_client.chat.completions.create(
@@ -333,26 +333,38 @@ CRITICAL RULES:
         # AI-Powered Recommendations
         recommendation = ""
         try:
-            # Get pairing suggestions from LLM
+            # Extract menu items for recommendations
+            menu_items_list = []
+            for row in menu_rows.data:
+                for line in row["content"].split("\n"):
+                    if line.startswith("item:"):
+                        menu_items_list.append(line.replace("item:", "").strip())
+            
             rec_prompt = f"""Based on this order: {items_str}
 
-Suggest ONE complementary item from the menu that pairs well.
-Keep it brief (one sentence).
+Suggest ONE complementary item that pairs well.
+Keep it brief (one sentence, under 50 words).
 
-Menu:
-{"\n".join([f"- {item}" for item in items[:5]])}
+Available menu items:
+{chr(10).join([f"- {item}" for item in menu_items_list[:10]])}
 
-Format: "Great choice! Many customers enjoy [ITEM] with that."
+Format: "Great choice! [ITEM] pairs perfectly with that."
+Do NOT suggest items already in the order.
 """
             rec_response = await groq_client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=[{"role": "user", "content": rec_prompt}],
-                temperature=0.7,
-                max_tokens=80
+                temperature=0.8,
+                max_tokens=60
             )
-            recommendation = f"\n\n💡 {rec_response.choices[0].message.content}"
+            rec_text = rec_response.choices[0].message.content.strip()
+            if rec_text:
+                recommendation = f"\n\n💡 {rec_text}"
+                print(f"[RECOMMENDATION] Generated: {rec_text}")
         except Exception as ex:
-            print(f"[RECOMMENDATION] {ex}")
+            print(f"[RECOMMENDATION ERROR] {ex}")
+            import traceback
+            traceback.print_exc()
 
         warning_line = ""
         aw = data.get("allergy_warning")
