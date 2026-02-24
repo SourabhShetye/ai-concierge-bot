@@ -237,10 +237,40 @@ async def process_new_order(
                 "a short warning string (e.g. 'Contains nuts!'). Otherwise set it to null."
             )
 
+        # Check for sold out items
+        sold_out_list = []
+        try:
+            sold_out_items = supabase.table("menu_items").select("content")\
+                .eq("restaurant_id", restaurant_id)\
+                .eq("sold_out", True).execute()
+            
+            if sold_out_items.data:
+                for item in sold_out_items.data:
+                    for line in item["content"].split("\n"):
+                        if line.startswith("item:"):
+                            sold_out_list.append(line.replace("item:", "").strip())
+        except Exception as ex:
+            print(f"[SOLD OUT CHECK] {ex}")
+
         prompt = f"""You are a restaurant order assistant.
 
 MENU:
 {menu_text}
+"""
+        
+        if sold_out_list:
+            prompt += f"\n\nSOLD OUT TODAY (DO NOT ACCEPT ORDERS FOR THESE):\n"
+            prompt += "\n".join(f"- {item}" for item in sold_out_list)
+        
+        prompt += f"""
+
+USER REQUEST: "{user_text}"
+        
+        if sold_out_list:
+            prompt += f"\n\nSOLD OUT TODAY (DO NOT ACCEPT ORDERS FOR THESE):\n"
+            prompt += "\n".join(f"- {item}" for item in sold_out_list)
+except Exception as ex:
+    print(f"[SOLD OUT CHECK] {ex}")
 
 USER REQUEST: "{user_text}"
 {pref_instruction}
@@ -299,6 +329,30 @@ CRITICAL RULES:
             "pending_modification": None,
         }).execute()
         order_id = result.data[0]["id"]
+        
+        # AI-Powered Recommendations
+        recommendation = ""
+        try:
+            # Get pairing suggestions from LLM
+            rec_prompt = f"""Based on this order: {items_str}
+
+Suggest ONE complementary item from the menu that pairs well.
+Keep it brief (one sentence).
+
+Menu:
+{"\n".join([f"- {item}" for item in items[:5]])}
+
+Format: "Great choice! Many customers enjoy [ITEM] with that."
+"""
+            rec_response = await groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": rec_prompt}],
+                temperature=0.7,
+                max_tokens=80
+            )
+            recommendation = f"\n\n💡 {rec_response.choices[0].message.content}"
+        except Exception as ex:
+            print(f"[RECOMMENDATION] {ex}")
 
         warning_line = ""
         aw = data.get("allergy_warning")
@@ -310,7 +364,7 @@ CRITICAL RULES:
                  f"💰 Total: *${total_price:.2f}*\n"
                  f"🪑 Table: {table_number}\n\n"
                  f"We'll notify you when it's ready! 🔔\n"
-                 f"_To modify: 'modify order #{order_id}' or /cancel_{warning_line}")
+                 f"_To modify: 'modify order #{order_id}' or /cancel_{warning_line}{recommendation}")
         return reply, order_id
 
     except Exception as ex:

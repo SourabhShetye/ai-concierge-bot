@@ -19,6 +19,9 @@ from typing import Optional, Dict, Any, List, Tuple
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Request
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 from fastapi.responses import Response, PlainTextResponse
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -44,6 +47,10 @@ GROQ_API_KEY   = os.getenv("GROQ_API_KEY")
 supabase:     Client               = create_client(SUPABASE_URL, SUPABASE_KEY)
 groq_client:  AsyncGroq            = AsyncGroq(api_key=GROQ_API_KEY)
 app:          FastAPI               = FastAPI(title="Restaurant Concierge API v6")
+# Rate limiting setup
+limiter = Limiter(key_func=get_remote_address, default_limits=["100/minute"])
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 telegram_app: Optional[Application] = None
 DUBAI_TZ = ZoneInfo("Asia/Dubai")
 
@@ -142,16 +149,33 @@ def save_preferences(user_id: str, pref: str):
     try: supabase.table("users").update({"preferences":pref}).eq("id",str(user_id)).execute()
     except Exception as ex: print(f"[CRM PREF] {ex}")
 
-def build_personalized_greeting(name: str, restaurant_name: str, tags: List[str]) -> str:
+def build_personalized_greeting(name: str, restaurant_name: str, tags: List[str], visit_count: int = 0) -> str:
+    # Milestone rewards
+    if visit_count == 5:
+        return (f"🎉 *Congratulations, {name}!*\n\n"
+                f"This is your **5th visit** to {restaurant_name}!\n"
+                f"🎁 Enjoy a **FREE appetizer** on us today!\n\n"
+                f"_Mention this message to your server._")
+    elif visit_count == 10:
+        return (f"🏆 *WOW! Visit #{visit_count}, {name}!*\n\n"
+                f"You're officially a {restaurant_name} Legend!\n"
+                f"🍰 Enjoy a **FREE dessert** today!\n\n"
+                f"_Show this to your server._")
+    elif visit_count % 10 == 0 and visit_count > 0:
+        return (f"🌟 *Amazing! Visit #{visit_count}, {name}!*\n\n"
+                f"We appreciate your loyalty!\n"
+                f"🎁 **10% off** your bill today!")
+    
+    # Regular greetings
     if "VIP" in tags or "Big Spender" in tags:
         msg = f"👑 Welcome back, *{name}*! As one of our VIP guests, you're very special to us."
         if random.random() < 0.20:
             msg += "\n\n🍹 *Complimentary drink on us today — mention this when you order!*"
         return msg
     if "Frequent Diner" in tags:
-        return f"😊 Welcome back, *{name}*! Great to see you again at *{restaurant_name}*."
+        return f"😊 Welcome back, *{name}*! Great to see you again at *{restaurant_name}*. (Visit #{visit_count})"
     if "Churn Risk" in tags:
-        return f"👋 *{name}*, we've missed you! So glad you're back at *{restaurant_name}*."
+        return f"👋 *{name}*, we've missed you! So glad you're back at *{restaurant_name}*.\n\n🎁 *Welcome back gift:* 15% off today!"
     return f"👋 Welcome to *{restaurant_name}*, *{name}*!"
 
 
@@ -361,7 +385,22 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if context.args:
         arg = context.args[0]
-        rid = arg.split("=")[1] if arg.startswith("rest_id=") else arg
+        rid = None  # Initialize rid variable
+        
+        # Check for QR code table assignment: /start table_5_rest_abc123
+        if arg.startswith("table_"):
+            parts = arg.split("_")
+            if len(parts) >= 3:
+                table_num = parts[1]
+                rid = "_".join(parts[2:])  # rest_abc123
+                
+                # We'll set table AFTER getting user context
+                print(f"[QR SCAN] Will assign Table {table_num}")
+        elif arg.startswith("rest_id="):
+            rid = arg.split("=")[1]
+        else:
+            rid = arg
+        
         try:
             chk = supabase.table("restaurants").select("id,name").eq("id",rid).execute()
             if chk.data: restaurant_id=chk.data[0]["id"]; restaurant_name=chk.data[0].get("name",restaurant_name)
@@ -400,6 +439,15 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Continue anyway - session will be created on name input as fallback
     
     uc = get_user_context(user.id, context)
+    
+    # NOW set table if QR scanned (after context is initialized)
+    if context.args and context.args[0].startswith("table_"):
+        parts = context.args[0].split("_")
+        if len(parts) >= 3:
+            uc["table_number"] = parts[1]
+            uc["qr_scanned"] = True
+            print(f"[QR SCAN] Table {parts[1]} auto-assigned to session {session_id[:8]}")
+  
     uc["session_id"] = session_id  # NEW: unique per /start
     uc["restaurant_id"] = restaurant_id
     uc["restaurant_name"] = restaurant_name
@@ -611,7 +659,12 @@ async def handle_pin_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE)
     crm = {"visit_count": 0, "total_spend": 0.0, "last_visit": None, "preferences": "", "tags": []}
     uc.update(crm)
     
-    greeting = build_personalized_greeting(name, uc.get("restaurant_name", "Our Restaurant"), crm["tags"])
+    greeting = build_personalized_greeting(
+        name, 
+        uc.get("restaurant_name", "Our Restaurant"), 
+        crm["tags"],
+        visit_count=crm.get("visit_count", 0)
+    )
     
     set_user_state(user.id, UserState.IDLE, context)
     set_mode(user.id, Mode.GENERAL, context)
@@ -791,9 +844,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=main_menu_keyboard(), parse_mode="Markdown")
     elif data == "mode_order":
         set_mode(user.id, Mode.ORDER, context)
-        set_user_state(user.id, UserState.AWAITING_TABLE, context)
-        await query.message.reply_text("🍽️ *Order Mode*\n\n🪑 What is your table number?",
-            reply_markup=back_button(), parse_mode="Markdown")
+        
+        # Check if table was set via QR code
+        if uc.get("qr_scanned") and uc.get("table_number"):
+            set_user_state(user.id, UserState.HAS_TABLE, context)
+            await query.message.reply_text(
+                f"🍽️ *Order Mode*\n\n"
+                f"✅ *Table {uc['table_number']}* (from QR code)\n\n"
+                f"What would you like to order?\n"
+                f"_Example: '2 Binary Bites and a Java Jolt'_",
+                reply_markup=back_button(),
+                parse_mode="Markdown"
+            )
+        else:
+            set_user_state(user.id, UserState.AWAITING_TABLE, context)
+            await query.message.reply_text(
+                "🍽️ *Order Mode*\n\n🪑 What is your table number?",
+                reply_markup=back_button(),
+                parse_mode="Markdown"
+            )
     elif data == "mode_booking":
         set_mode(user.id, Mode.BOOKING, context)
         # NEW: Ask if user wants to book or cancel
@@ -1378,6 +1447,20 @@ async def handle_general_chat(update: Update, context: ContextTypes.DEFAULT_TYPE
               +(f"RESTAURANT INFO:\n{policy_ctx}\n\n" if policy_ctx else "")
               +"Answer questions about menu/WiFi/parking/hours concisely (2-3 sentences). "
               "Never take orders or handle bookings.")
+    # Detect language and translate if needed
+    try:
+        lang_detect = await groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": f"What language is this text in? Answer with one word only: '{text[:100]}'"}],
+            temperature=0,
+            max_tokens=10
+        )
+        detected = lang_detect.choices[0].message.content.strip().lower()
+        if detected in ["hindi", "arabic", "spanish", "french", "urdu"]:
+            language = detected.capitalize()
+            system += f"\n\nIMPORTANT: User is communicating in {language}. Respond in {language}."
+    except Exception:
+        pass
     try:
         c = await groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
@@ -1479,6 +1562,59 @@ async def handle_order_mode_chat(update: Update, context: ContextTypes.DEFAULT_T
         print(f"[ORDERCHAT] {ex}"); await update.message.reply_text("I'm here to help!",reply_markup=back_button())
 
 
+# ── Voice Message Handler ──────────────────────────────────────────────────────
+
+async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle voice notes using Groq Whisper transcription"""
+    user = update.effective_user
+    uc = get_user_context(user.id, context)
+    
+    try:
+        # Download voice file
+        voice = update.message.voice
+        file = await context.bot.get_file(voice.file_id)
+        
+        # Download to temporary file
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+            await file.download_to_drive(tmp.name)
+            tmp_path = tmp.name
+        
+        # Transcribe using Groq Whisper
+        with open(tmp_path, "rb") as audio_file:
+            transcription = await groq_client.audio.transcriptions.create(
+                file=audio_file,
+                model="whisper-large-v3",
+                response_format="text"
+            )
+        
+        # Clean up temp file
+        import os
+        os.unlink(tmp_path)
+        
+        transcribed_text = transcription.strip()
+        print(f"[VOICE] Transcribed: {transcribed_text}")
+        
+        # Show transcription to user
+        await update.message.reply_text(
+            f"🎤 *I heard:* _{transcribed_text}_\n\nProcessing your request...",
+            parse_mode="Markdown"
+        )
+        
+        # Process as regular text message
+        # Create a fake text message with the transcription
+        update.message.text = transcribed_text
+        await message_handler(update, context)
+        
+    except Exception as ex:
+        print(f"[VOICE ERROR] {ex}")
+        import traceback
+        traceback.print_exc()
+        await update.message.reply_text(
+            "❌ Sorry, I couldn't understand the voice message. Please try typing instead.",
+            reply_markup=back_button()
+        )
+
 # ── Main message router ────────────────────────────────────────────────────────
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1569,12 +1705,28 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── FastAPI ────────────────────────────────────────────────────────────────────
 
 @app.post("/webhook")
+@limiter.limit("60/minute")  # Max 60 messages per minute per user
 async def telegram_webhook(request: Request):
     try:
         data = await request.json()
         update = Update.de_json(data, telegram_app.bot)
+        
+        # Extract user_id for per-user rate limiting
+        user_id = None
+        if update.message:
+            user_id = update.message.from_user.id
+        elif update.callback_query:
+            user_id = update.callback_query.from_user.id
+        
+        # Check user-specific rate limit (stored in context)
+        if user_id:
+            # You can add Redis-based rate limiting here for production
+            pass
+        
         await telegram_app.process_update(update)
         return {"status":"ok"}
+    except RateLimitExceeded:
+        return {"status":"error","message":"Rate limit exceeded. Please slow down."}
     except Exception as ex:
         print(f"[WEBHOOK] {ex}"); return {"status":"error","message":str(ex)}
 
@@ -1625,6 +1777,7 @@ async def startup_event():
     telegram_app.add_handler(CommandHandler("modify_booking", modify_booking_command))
     telegram_app.add_handler(CallbackQueryHandler(button_handler))
     telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    telegram_app.add_handler(MessageHandler(filters.VOICE, handle_voice_message))
     await telegram_app.initialize(); await telegram_app.start()
     print("✅ Bot v6 started")
 

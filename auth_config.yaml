@@ -1,0 +1,31 @@
+credentials:
+  usernames:
+    admin:
+      email: admin@restaurant.com
+      name: Admin User
+      password: $2b$12$KIXqvB8F0L.NxH7mF5FZ0uGxN8nXvqxFzJ9YwU8nH8L.NxH7mF5FZ0  # "admin123" hashed
+    chef:
+      email: chef@restaurant.com
+      name: Chef John
+      password: $2b$12$KIXqvB8F0L.NxH7mF5FZ0uGxN8nXvqxFzJ9YwU8nH8L.NxH7mF5FZ0  # "chef123" hashed
+    manager:
+      email: manager@restaurant.com
+      name: Manager Sarah
+      password: $2b$12$KIXqvB8F0L.NxH7mF5FZ0uGxN8nXvqxFzJ9YwU8nH8L.NxH7mF5FZ0  # "manager123" hashed
+
+cookie:
+  expiry_days: 30
+  key: restaurant_auth_key_2026  # Change this to a random string
+  name: restaurant_auth_cookie
+
+preauthorized:
+  emails:
+  - admin@restaurant.com
+
+roles:
+  admin:
+    - admin
+  chef:
+    - chef
+  manager:
+    - manager

@@ -20,6 +20,10 @@ from streamlit_autorefresh import st_autorefresh
 from dotenv import load_dotenv
 from supabase import create_client
 
+import streamlit_authenticator as stauth
+import yaml
+from yaml.loader import SafeLoader
+
 import sys
 sys.path.insert(0, os.path.dirname(__file__))
 from order_service import update_crm_on_payment
@@ -32,6 +36,31 @@ def to_dubai(utc_dt):
 
 st.set_page_config(page_title="Restaurant Admin", layout="wide",
                    page_icon="👨‍🍳", initial_sidebar_state="expanded")
+
+# ── Authentication ─────────────────────────────────────────────────────────────
+with open('auth_config.yaml') as file:
+    config = yaml.load(file, Loader=SafeLoader)
+
+authenticator = stauth.Authenticate(
+    config['credentials'],
+    config['cookie']['name'],
+    config['cookie']['key'],
+    config['cookie']['expiry_days'],
+    config['preauthorized']
+)
+
+name, authentication_status, username = authenticator.login('Login', 'main')
+
+if authentication_status == False:
+    st.error('Username/Password is incorrect')
+    st.stop()
+
+if authentication_status == None:
+    st.warning('Please enter your username and password')
+    st.stop()
+
+# Get user role
+user_role = config['roles'].get(username, ['viewer'])[0]
 st_autorefresh(interval=10000, key="global_refresh")
 load_dotenv()
 
@@ -64,7 +93,7 @@ def compute_tags(row):
     if lv and vc > 0:
         try:
             lv_dt = datetime.fromisoformat(str(lv).replace("Z","+00:00"))
-            if (datetime.now(timezone.utc) - lv_dt) > timedelta(days=2):
+            if (datetime.now(timezone.utc) - lv_dt) > timedelta(days=30):
                 tags.append("Churn Risk")
         except Exception: pass
     return tags
@@ -121,11 +150,29 @@ st.sidebar.info(f"🔄 {get_ts()}")
 st.title(f"📊 Dashboard: {sel_name}")
 st.markdown("---")
 
-tab1,tab2,tab3,tab4,tab5,tab6,tab7 = st.tabs([
-    "📅 Bookings","👨‍🍳 Kitchen Display","💰 Live Tables",
-    "🍽️ Menu Manager","ℹ️ Policies & Settings",
-    "👥 Customer Insights","🪑 Table Inventory",
-])
+# Role-based tab visibility
+if user_role == "chef":
+    # Chef: Kitchen Display only
+    tab2 = st.container()
+    with tab2:
+        st.header("🔥 Kitchen Display System")
+        # All KDS code goes here (move from tab2 section)
+elif user_role == "manager":
+    # Manager: All tabs except Kitchen Display
+    tab1,tab3,tab4,tab5,tab6,tab7 = st.tabs([
+        "📅 Bookings","💰 Live Tables","🍽️ Menu Manager",
+        "ℹ️ Policies","👥 Customer Insights","🪑 Table Inventory",
+    ])
+elif user_role == "admin":
+    # Admin: All tabs
+    tab1,tab2,tab3,tab4,tab5,tab6,tab7 = st.tabs([
+        "📅 Bookings","👨‍🍳 Kitchen Display","💰 Live Tables",
+        "🍽️ Menu Manager","ℹ️ Policies & Settings",
+        "👥 Customer Insights","🪑 Table Inventory",
+    ])
+else:
+    st.error("Invalid role. Contact administrator.")
+    st.stop()
 
 with tab1:
     st.header("📅 Reservations & Bookings")
@@ -349,6 +396,19 @@ with tab3:
                                       f"⭐ *Please rate (1-5):*\n\n{dishes}\n\nReply: 5,4,5 _(per dish+overall)_")
                             ok = send_telegram(data["chat_id"], fb_msg) if data["chat_id"] else False
                             st.success(f"✅ Table {tn} closed" + (" & feedback sent" if ok else "")); st.rerun()
+                            # Monitor for negative feedback (async task)
+                            if data["chat_id"]:
+                                # Store table context for feedback monitoring
+                                try:
+                                    supabase.table("pending_feedback").insert({
+                                        "restaurant_id": cur_rid,
+                                        "table_number": tn,
+                                        "chat_id": data["chat_id"],
+                                        "dishes": dishes,
+                                        "created_at": get_ts()
+                                    }).execute()
+                                except Exception:
+                                    pass  # Table may not exist, that's okay
                         except Exception as ex: st.error(f"{ex}")
         else: st.info("📭 No active tables")
     except Exception as ex: st.error(f"{ex}")
@@ -390,12 +450,30 @@ with tab4:
                 rid_row=entry["id"]; p=entry["p"]; ekey=f"edit_{rid_row}"
                 if ekey not in st.session_state: st.session_state[ekey]=False
                 with st.container(border=True):
-                    dc1,dc2,dc3,dc4 = st.columns([3,1.5,1,1])
+                    dc1,dc2,dc3,dc4,dc5 = st.columns([3,1.5,1,1,1])
                     dc1.write(f"**{p['item']}**")
                     if p["description"]: dc1.caption(p["description"])
-                    dc2.write(f"💰 {p['price']}")
-                    if dc3.button("✏️",key=f"eb_{rid_row}",use_container_width=True): st.session_state[ekey]=not st.session_state[ekey]
-                    if dc4.button("🗑️",key=f"db_{rid_row}",use_container_width=True):
+                    
+                    # Get sold_out status from database
+                    try:
+                        item_data = supabase.table("menu_items").select("sold_out").eq("id", rid_row).limit(1).execute()
+                        sold_out = item_data.data[0].get("sold_out", False) if item_data.data else False
+                    except Exception:
+                        sold_out = False
+                    if sold_out:
+                        dc2.error("❌ SOLD OUT")
+                    else:
+                        dc2.write(f"💰 {p['price']}")
+                    # Sold out toggle button
+                    toggle_text = "✅ In Stock" if sold_out else "❌ Mark Sold Out"
+                    if dc3.button(toggle_text, key=f"toggle_{rid_row}", use_container_width=True):
+                        try:
+                            supabase.table("menu_items").update({"sold_out": not sold_out}).eq("id", rid_row).execute()
+                            st.rerun()
+                        except Exception as ex:
+                            st.error(f"{ex}")
+                    if dc4.button("✏️",key=f"eb_{rid_row}",use_container_width=True): st.session_state[ekey]=not st.session_state[ekey]
+                    if dc5.button("🗑️",key=f"db_{rid_row}",use_container_width=True):
                         try: supabase.table("menu_items").delete().eq("id",rid_row).execute(); st.rerun()
                         except Exception as ex: st.error(f"{ex}")
                     if st.session_state.get(ekey):
