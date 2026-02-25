@@ -265,14 +265,6 @@ MENU:
         prompt += f"""
 
 USER REQUEST: "{user_text}"
-        
-        if sold_out_list:
-            prompt += f"\n\nSOLD OUT TODAY (DO NOT ACCEPT ORDERS FOR THESE):\n"
-            prompt += "\n".join(f"- {item}" for item in sold_out_list)
-except Exception as ex:
-    print(f"[SOLD OUT CHECK] {ex}")
-
-USER REQUEST: "{user_text}"
 {pref_instruction}
 
 Return JSON only:
@@ -292,13 +284,16 @@ CRITICAL RULES:
 - If user says a quantity WITHOUT item name, match to closest menu item:
   * "2 of 404" → "2x 404 Fizz Not Found"
 - Only list items from the menu above (but be flexible with naming)
-- Format SINGLE items as: ItemName ($price)
-- Format MULTIPLE items as: Nx ItemName ($unit_price each)
-  CRITICAL EXAMPLES:
+- Format items consistently:
+  * Single item: "ItemName ($price)"
+  * Multiple items: "Nx ItemName ($price each)" where $price is UNIT PRICE
+  
+CRITICAL EXAMPLES:
   * 1x Carbonara at $32 = "Carbonara ($32)"
-  * 2x Carbonara at $32 each = "2x Carbonara ($32 each)"
-  * 3x Fries at $7 each = "3x Fries ($7 each)"
-  The price shows UNIT PRICE with "each" suffix for clarity!
+  * 2x Carbonara at $32 each = "2x Carbonara ($32 each)" ← Shows $32 per item, not $64 total
+  * 3x Fries at $7 each = "3x Fries ($7 each)" ← Shows $7 per item, not $21 total
+  
+The price in parentheses for multiples MUST show unit price with " each" suffix!
 - Do NOT include total_price field
 """
         c = await groq_client.chat.completions.create(
@@ -376,7 +371,7 @@ Do NOT suggest items already in the order.
                  f"💰 Total: *${total_price:.2f}*\n"
                  f"🪑 Table: {table_number}\n\n"
                  f"We'll notify you when it's ready! 🔔\n"
-                 f"_To modify: 'modify order #{order_id}' or /cancel_{warning_line}{recommendation}")
+                 f"_To modify: type 'modify order' or /cancel_{warning_line}{recommendation}")
         return reply, order_id
 
     except Exception as ex:

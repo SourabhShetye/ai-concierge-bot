@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: restaurant-concierge
+    runtime: python
+    plan: free  # or 'starter' for paid plan
+    buildCommand: pip install -r requirements.txt
+    startCommand: python web_chat_combined.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: PORT
+        value: 10000

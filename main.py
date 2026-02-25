@@ -856,14 +856,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Check if table was set via QR code
         if uc.get("qr_scanned") and uc.get("table_number"):
             set_user_state(user.id, UserState.HAS_TABLE, context)
-            await query.message.reply_text(
-                f"🍽️ *Order Mode*\n\n"
-                f"✅ *Table {uc['table_number']}* (from QR code)\n\n"
-                f"What would you like to order?\n"
-                f"_Example: '2 Binary Bites and a Java Jolt'_",
-                reply_markup=back_button(),
-                parse_mode="Markdown"
-            )
+            
+            # Check if preferences already set
+            if not uc.get("preferences"):
+                await query.message.reply_text(
+                    f"🍽️ *Order Mode*\n\n"
+                    f"✅ *Table {uc['table_number']}* (from QR code)\n\n"
+                    f"⚠️ *Do you have any allergies or dietary restrictions?*\n\n"
+                    f"_Examples: 'allergic to nuts', 'vegetarian', 'no gluten'_\n\n"
+                    f"Or type *'none'* if you have no restrictions.",
+                    reply_markup=back_button(),
+                    parse_mode="Markdown"
+                )
+            else:
+                await query.message.reply_text(
+                    f"🍽️ *Order Mode*\n\n"
+                    f"✅ *Table {uc['table_number']}* (from QR code)\n\n"
+                    f"What would you like to order?\n\n_Type /menu to see all available dishes._",
+                    reply_markup=back_button(),
+                    parse_mode="Markdown"
+                )
         else:
             set_user_state(user.id, UserState.AWAITING_TABLE, context)
             await query.message.reply_text(
@@ -1558,6 +1570,8 @@ async def handle_order_mode_chat(update: Update, context: ContextTypes.DEFAULT_T
     if any(k in text_lower for k in ["change booking","modify booking","change reservation","modify reservation"]):
         await modify_booking_command(update, context); return
 
+    state = get_user_state(user.id, context)  # ADD THIS LINE
+    
     # Allergy detection - handle both new input and "none"
     if state == UserState.HAS_TABLE and not uc.get("preferences_set"):
         if text_lower in ["none", "no", "nope", "nothing", "n/a"]:
@@ -1746,24 +1760,20 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
             audio_path = ogg_path
         
         # Transcribe using Groq Whisper
-        with open(tmp_path, "rb") as audio_file:
+        with open(audio_path, "rb") as audio_file:
             print(f"[VOICE] Sending to Groq Whisper API...")
             transcription = await groq_client.audio.transcriptions.create(
-                file=(tmp_path, audio_file),
+                file=(audio_path, audio_file),
                 model="whisper-large-v3",
                 response_format="text"
             )
             print(f"[VOICE] Transcription received: {len(transcription)} chars")
         
-        # Clean up both files
+        # Clean up files
         import os
         os.unlink(ogg_path)
         if os.path.exists(mp3_path):
             os.unlink(mp3_path)
-        
-        # Clean up temp file
-        import os
-        os.unlink(tmp_path)
         
         transcribed_text = transcription.strip()
         print(f"[VOICE] Transcribed: {transcribed_text}")
