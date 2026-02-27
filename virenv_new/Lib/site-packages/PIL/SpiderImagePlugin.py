@@ -104,7 +104,6 @@ class SpiderImageFile(ImageFile.ImageFile):
     def _open(self) -> None:
         # check header
         n = 27 * 4  # read 27 float values
-        assert self.fp is not None
         f = self.fp.read(n)
 
         try:
@@ -324,9 +323,9 @@ if __name__ == "__main__":
             outfile = sys.argv[2]
 
             # perform some image operation
-            transposed_im = im.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+            im = im.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
             print(
                 f"saving a flipped version of {os.path.basename(filename)} "
                 f"as {outfile} "
             )
-            transposed_im.save(outfile, SpiderImageFile.format)
+            im.save(outfile, SpiderImageFile.format)

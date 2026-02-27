@@ -1,3 +1,27 @@
+cat > .gitignore << 'EOF'
+# Environment
 .env
-virenv/
+venv/
 __pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Output
+qr_codes/
+*.log
+
+# Secrets
+auth_config.yaml.backup
+EOF

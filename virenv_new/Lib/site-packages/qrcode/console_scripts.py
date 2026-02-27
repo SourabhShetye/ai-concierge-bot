@@ -9,8 +9,7 @@ a pipe to a file an image is written. The default image format is PNG.
 import optparse
 import os
 import sys
-from typing import NoReturn, Optional
-from collections.abc import Iterable
+from typing import Dict, Iterable, NoReturn, Optional, Set, Type
 from importlib import metadata
 
 import qrcode
@@ -141,7 +140,7 @@ def main(args=None):
         img.save(sys.stdout.buffer)
 
 
-def get_factory(module: str) -> type[BaseImage]:
+def get_factory(module: str) -> Type[BaseImage]:
     if "." not in module:
         raise ValueError("The image factory is not a full python path")
     module, name = module.rsplit(".", 1)
@@ -150,7 +149,7 @@ def get_factory(module: str) -> type[BaseImage]:
 
 
 def get_drawer_help() -> str:
-    help: dict[str, set] = {}
+    help: Dict[str, Set] = {}
     for alias, module in default_factories.items():
         try:
             image = get_factory(module)
