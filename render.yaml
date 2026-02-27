@@ -1,13 +1,19 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Render.com Deployment Configuration
+# ═══════════════════════════════════════════════════════════════════════════
+
 services:
+  # Main Server (Telegram Bot + Web Chat)
   - type: web
     name: restaurant-concierge
     runtime: python
-    plan: free  # or 'starter' for paid plan
+    plan: free  # Change to 'starter' for paid plan with more resources
     buildCommand: pip install -r requirements.txt
-    startCommand: python web_chat_combined.py
+    startCommand: python app/main.py
+    
     envVars:
       - key: TELEGRAM_BOT_TOKEN
-        sync: false
+        sync: false  # Set manually in Render dashboard
       - key: SUPABASE_URL
         sync: false
       - key: SUPABASE_KEY
@@ -16,3 +22,19 @@ services:
         sync: false
       - key: PORT
         value: 10000
+    
+    healthCheckPath: /ping
+    
+  # Admin Dashboard (Optional - deploy separately)
+  # - type: web
+  #   name: restaurant-admin
+  #   runtime: python
+  #   plan: free
+  #   buildCommand: pip install -r requirements.txt
+  #   startCommand: streamlit run admin.py --server.port=$PORT --server.address=0.0.0.0
+  #   
+  #   envVars:
+  #     - key: SUPABASE_URL
+  #       sync: false
+  #     - key: SUPABASE_KEY
+  #       sync: false

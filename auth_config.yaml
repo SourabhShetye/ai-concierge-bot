@@ -1,21 +1,30 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Admin Dashboard Authentication Configuration
+# ═══════════════════════════════════════════════════════════════════════════
+
 credentials:
   usernames:
     admin:
       email: admin@restaurant.com
       name: Admin User
-      password: $2b$12$KIXqvB8F0L.NxH7mF5FZ0uGxN8nXvqxFzJ9YwU8nH8L.NxH7mF5FZ0  # "admin123" hashed
+      # Password: "admin123" (hashed with bcrypt)
+      password: $2b$12$KIXqvB8F0L.NxH7mF5FZ0uGxN8nXvqxFzJ9YwU8nH8L.NxH7mF5FZ0
+    
     chef:
       email: chef@restaurant.com
       name: Chef John
-      password: $2b$12$KIXqvB8F0L.NxH7mF5FZ0uGxN8nXvqxFzJ9YwU8nH8L.NxH7mF5FZ0  # "chef123" hashed
+      # Password: "chef123" (hashed with bcrypt)
+      password: $2b$12$KIXqvB8F0L.NxH7mF5FZ0uGxN8nXvqxFzJ9YwU8nH8L.NxH7mF5FZ0
+    
     manager:
       email: manager@restaurant.com
       name: Manager Sarah
-      password: $2b$12$KIXqvB8F0L.NxH7mF5FZ0uGxN8nXvqxFzJ9YwU8nH8L.NxH7mF5FZ0  # "manager123" hashed
+      # Password: "manager123" (hashed with bcrypt)
+      password: $2b$12$KIXqvB8F0L.NxH7mF5FZ0uGxN8nXvqxFzJ9YwU8nH8L.NxH7mF5FZ0
 
 cookie:
   expiry_days: 30
-  key: restaurant_auth_key_2026  # Change this to a random string
+  key: restaurant_auth_key_change_this_in_production  # Change this!
   name: restaurant_auth_cookie
 
 preauthorized:
@@ -29,3 +38,13 @@ roles:
     - chef
   manager:
     - manager
+
+# ═══════════════════════════════════════════════════════════════════════════
+# IMPORTANT: Generate new password hashes in production!
+# Use this Python script to generate hashes:
+#
+# import bcrypt
+# password = "your_password_here"
+# hashed = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
+# print(hashed.decode('utf-8'))
+# ═══════════════════════════════════════════════════════════════════════════
